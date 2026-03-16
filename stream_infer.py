@@ -1440,7 +1440,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                                preload_topk=0, cache_gb=20.0, profile=False,
                                use_pread=False, pread_index=None, pread_fds=None,
                                use_cext=False, batch_experts=False,
-                               top_k_override=0):
+                               top_k_override=0, no_expert_cache=False):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1517,43 +1517,50 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     # Size = num_layers * active_experts_per_token * N tokens of history.
     # Cap total cache memory at 20GB to leave headroom for OS on 48GB machine.
     active_experts = lm.args.num_experts_per_tok if top_k_override <= 0 else min(lm.args.num_experts_per_tok, top_k_override)
-    cache_entries = num_layers * active_experts * 8
     if top_k_override > 0:
         print(f"  [top-k override] Using {active_experts} experts/token (model default: {lm.args.num_experts_per_tok})")
 
-    # Estimate per-entry bytes to enforce memory cap
-    hidden = lm.args.hidden_size
-    intermediate = lm.args.moe_intermediate_size
-    # 3 projections (gate, up, down) each with weight(U32,4bit) + scales(BF16) + biases(BF16)
-    # Per projection: intermediate*hidden/2 (weight) + intermediate*hidden/32 (scales+biases)
-    # = intermediate*hidden*9/16 per projection, x3 projections
-    per_expert_bytes = 3 * intermediate * hidden * 9 // 16
-    max_cache_gb = cache_gb
-    # Memory safety: cap total DRAM = non_expert (~5GB) + cache; leave ~5GB for OS on 48GB machine
-    if max_cache_gb + 5 > 43:
-        adjusted = 43.0 - 5.0
-        print(f"[cache] WARNING: cache_gb={max_cache_gb:.1f} + non-expert (~5GB) exceeds 43GB safety limit. "
-              f"Reducing cache to {adjusted:.1f}GB")
-        max_cache_gb = adjusted
-    max_entries_by_mem = int(max_cache_gb * 1e9 / per_expert_bytes) if per_expert_bytes > 0 else cache_entries
-    if cache_entries > max_entries_by_mem:
-        print(f"[cache] Capping entries from {cache_entries} to {max_entries_by_mem} "
-              f"(~{max_cache_gb:.0f}GB limit, {per_expert_bytes/1e6:.1f}MB/entry)")
-        cache_entries = max_entries_by_mem
-    elif max_entries_by_mem > cache_entries:
-        # When --cache-gb allows more than the heuristic, use full memory budget
-        print(f"[cache] Expanding entries from {cache_entries} to {max_entries_by_mem} "
-              f"(~{max_cache_gb:.0f}GB budget, {per_expert_bytes/1e6:.1f}MB/entry)")
-        cache_entries = max_entries_by_mem
+    expert_cache = None  # may remain None when --no-expert-cache
 
-    expert_cache = ExpertCache(max_entries=cache_entries)
+    if no_expert_cache:
+        print(f"  [no-expert-cache] Skipping ExpertCache — OS page cache handles all expert reads.")
+        print(f"  [no-expert-cache] All {active_experts} active experts read from safetensors per layer per token.")
+    else:
+        cache_entries = num_layers * active_experts * 8
 
-    # === Pre-load hot experts if requested ===
-    if preload_topk > 0:
-        preload_hot_experts(expert_cache, weight_index, model_path, num_layers,
-                            preload_topk, header_cache,
-                            use_pread=use_pread, pread_index=pread_index,
-                            pread_fds=pread_fds)
+        # Estimate per-entry bytes to enforce memory cap
+        hidden = lm.args.hidden_size
+        intermediate = lm.args.moe_intermediate_size
+        # 3 projections (gate, up, down) each with weight(U32,4bit) + scales(BF16) + biases(BF16)
+        # Per projection: intermediate*hidden/2 (weight) + intermediate*hidden/32 (scales+biases)
+        # = intermediate*hidden*9/16 per projection, x3 projections
+        per_expert_bytes = 3 * intermediate * hidden * 9 // 16
+        max_cache_gb = cache_gb
+        # Memory safety: cap total DRAM = non_expert (~5GB) + cache; leave ~5GB for OS on 48GB machine
+        if max_cache_gb + 5 > 43:
+            adjusted = 43.0 - 5.0
+            print(f"[cache] WARNING: cache_gb={max_cache_gb:.1f} + non-expert (~5GB) exceeds 43GB safety limit. "
+                  f"Reducing cache to {adjusted:.1f}GB")
+            max_cache_gb = adjusted
+        max_entries_by_mem = int(max_cache_gb * 1e9 / per_expert_bytes) if per_expert_bytes > 0 else cache_entries
+        if cache_entries > max_entries_by_mem:
+            print(f"[cache] Capping entries from {cache_entries} to {max_entries_by_mem} "
+                  f"(~{max_cache_gb:.0f}GB limit, {per_expert_bytes/1e6:.1f}MB/entry)")
+            cache_entries = max_entries_by_mem
+        elif max_entries_by_mem > cache_entries:
+            # When --cache-gb allows more than the heuristic, use full memory budget
+            print(f"[cache] Expanding entries from {cache_entries} to {max_entries_by_mem} "
+                  f"(~{max_cache_gb:.0f}GB budget, {per_expert_bytes/1e6:.1f}MB/entry)")
+            cache_entries = max_entries_by_mem
+
+        expert_cache = ExpertCache(max_entries=cache_entries)
+
+        # === Pre-load hot experts if requested ===
+        if preload_topk > 0:
+            preload_hot_experts(expert_cache, weight_index, model_path, num_layers,
+                                preload_topk, header_cache,
+                                use_pread=use_pread, pread_index=pread_index,
+                                pread_fds=pread_fds)
 
     # === Cache quantization parameters from model config (read once) ===
     # These are needed by compute_moe_direct for mx.gather_qmm calls.
@@ -1701,133 +1708,197 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             for name, filepath in expert_entries:
                 expert_file_map[name] = filepath
 
-            # --- LRU cache: determine which experts need disk reads ---
-            if profile:
-                t_cache_lookup = time.perf_counter()
+            # --- Expert loading: no-cache path vs LRU cache path ---
+            if no_expert_cache:
+                # ---- NO-CACHE PATH ----
+                # Read ALL active experts directly from safetensors (mmap).
+                # OS page cache handles caching at the VM level.
+                if profile:
+                    layer_cache_lookup_ms = 0.0  # no cache to look up
+                    t_io_start = time.perf_counter()
+                    layer_io_bytes = 0
 
-            uncached_list = []
-            layer_cache_hits = 0
-            layer_cache_misses = 0
-            # Protect all experts needed for this layer from eviction
-            expert_cache.protect([(i, idx) for idx in unique_list])
-            for idx in unique_list:
-                if expert_cache.has_expert(i, idx):
-                    expert_cache.record_hit()
-                    expert_cache.touch(i, idx)
-                    layer_cache_hits += 1
-                else:
-                    expert_cache.record_miss()
-                    uncached_list.append(idx)
-                    layer_cache_misses += 1
+                layer_cache_hits = 0
+                layer_cache_misses = num_unique  # all are "misses" (all read from disk/page-cache)
 
-            if profile:
-                t_cache_lookup_done = time.perf_counter()
-                layer_cache_lookup_ms = (t_cache_lookup_done - t_cache_lookup) * 1000
+                # Pre-populate header_cache for all expert files
+                for filepath in set(expert_file_map.values()):
+                    if filepath not in header_cache:
+                        header_cache[filepath] = parse_safetensors_header(filepath)
 
-            # Read only uncached experts from disk (threaded: one expert per thread)
-            if profile:
-                t_io_start = time.perf_counter()
-                layer_io_bytes = 0
+                # Read ALL unique experts via _read_single_expert_attrs
+                # Collect per-expert results: {expert_idx: {(proj, attr): mx.array}}
+                all_expert_attrs = {}
+                with ThreadPoolExecutor(max_workers=min(4, num_unique)) as executor:
+                    futures = [
+                        executor.submit(
+                            _read_single_expert_attrs,
+                            expert_idx, i, expert_file_map, header_cache
+                        )
+                        for expert_idx in unique_list
+                    ]
+                    for future in futures:
+                        eidx, attrs, io_stats = future.result()
+                        all_expert_attrs[eidx] = attrs
+                        token_io_bytes += io_stats["bytes_read"]
+                        token_io_seeks += io_stats["seek_count"]
+                        token_io_time += io_stats["io_time_s"]
+                        token_array_time += io_stats["array_time_s"]
+                        if profile:
+                            layer_io_bytes += io_stats["bytes_read"]
 
-            if uncached_list:
-                if use_cext:
-                    # fast_expert_io C extension path (preadv + coalesced I/O)
-                    import fast_expert_io
-                    t_cext_io = time.time()
-                    cext_results = fast_expert_io.batch_read(i, uncached_list)
-                    cext_io_time = time.time() - t_cext_io
+                if profile:
+                    t_io_done = time.perf_counter()
+                    layer_io_ms = (t_io_done - t_io_start) * 1000
 
-                    t_cext_arr = time.time()
-                    cext_io_bytes = 0
-                    for eidx, comp_dict in cext_results.items():
-                        for comp_name, np_arr in comp_dict.items():
-                            parts = comp_name.split(".")
-                            proj_name = parts[0]
-                            attr_name = parts[1]
-                            cext_io_bytes += np_arr.nbytes
-
-                            if np_arr.dtype == np.uint16:
-                                # BF16: stored as uint16, convert to bfloat16
-                                np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
-                                mx_arr = mx.array(np_f32).astype(mx.bfloat16)
+                # Assemble [num_unique, ...] weight tensors for compute_moe_direct
+                expert_tensors = {}
+                for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                    for attr_name in ["weight", "scales", "biases"]:
+                        slices = []
+                        for idx in unique_list:
+                            arr = all_expert_attrs[idx].get((proj_name, attr_name))
+                            if arr is not None:
+                                slices.append(arr)
                             else:
-                                mx_arr = mx.array(np_arr)
-                            expert_cache.put_attr(i, eidx, proj_name, attr_name, mx_arr)
-                    cext_arr_time = time.time() - t_cext_arr
+                                raise RuntimeError(
+                                    f"No-cache read miss: layer={i} expert={idx} "
+                                    f"{proj_name}.{attr_name} not found"
+                                )
+                        if slices:
+                            expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+                del all_expert_attrs
 
-                    token_io_bytes += cext_io_bytes
-                    token_io_seeks += len(uncached_list) * 9  # 9 components per expert
-                    token_io_time += cext_io_time
-                    token_array_time += cext_arr_time
-                    if profile:
-                        layer_io_bytes += cext_io_bytes
+            else:
+                # ---- LRU CACHE PATH (original) ----
+                # Determine which experts need disk reads
+                if profile:
+                    t_cache_lookup = time.perf_counter()
 
-                elif use_pread and pread_index is not None:
-                    # pread()-based expert loading (bypasses safetensors)
-                    batch_results, io_stats = pread_expert_batch(
-                        pread_index, pread_fds, i, uncached_list)
-                    token_io_bytes += io_stats["bytes_read"]
-                    token_io_seeks += io_stats["seek_count"]
-                    token_io_time += io_stats["io_time_s"]
-                    token_array_time += io_stats["array_time_s"]
-                    if profile:
-                        layer_io_bytes += io_stats["bytes_read"]
-                    for eidx, attrs in batch_results.items():
-                        for (proj_name, attr_name), arr in attrs.items():
-                            expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
-                else:
-                    # Original safetensors path
-                    # Pre-populate header_cache for all expert files (thread-safe after this)
-                    for filepath in set(expert_file_map.values()):
-                        if filepath not in header_cache:
-                            header_cache[filepath] = parse_safetensors_header(filepath)
+                uncached_list = []
+                layer_cache_hits = 0
+                layer_cache_misses = 0
+                # Protect all experts needed for this layer from eviction
+                expert_cache.protect([(i, idx) for idx in unique_list])
+                for idx in unique_list:
+                    if expert_cache.has_expert(i, idx):
+                        expert_cache.record_hit()
+                        expert_cache.touch(i, idx)
+                        layer_cache_hits += 1
+                    else:
+                        expert_cache.record_miss()
+                        uncached_list.append(idx)
+                        layer_cache_misses += 1
 
-                    # Parallel read: each thread reads all 9 attrs for one expert
-                    with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
-                        futures = [
-                            executor.submit(
-                                _read_single_expert_attrs,
-                                expert_idx, i, expert_file_map, header_cache
-                            )
-                            for expert_idx in uncached_list
-                        ]
-                        for future in futures:
-                            eidx, attrs, io_stats = future.result()
-                            # Accumulate I/O stats from this expert read
-                            token_io_bytes += io_stats["bytes_read"]
-                            token_io_seeks += io_stats["seek_count"]
-                            token_io_time += io_stats["io_time_s"]
-                            token_array_time += io_stats["array_time_s"]
-                            if profile:
-                                layer_io_bytes += io_stats["bytes_read"]
+                if profile:
+                    t_cache_lookup_done = time.perf_counter()
+                    layer_cache_lookup_ms = (t_cache_lookup_done - t_cache_lookup) * 1000
+
+                # Read only uncached experts from disk (threaded: one expert per thread)
+                if profile:
+                    t_io_start = time.perf_counter()
+                    layer_io_bytes = 0
+
+                if uncached_list:
+                    if use_cext:
+                        # fast_expert_io C extension path (preadv + coalesced I/O)
+                        import fast_expert_io
+                        t_cext_io = time.time()
+                        cext_results = fast_expert_io.batch_read(i, uncached_list)
+                        cext_io_time = time.time() - t_cext_io
+
+                        t_cext_arr = time.time()
+                        cext_io_bytes = 0
+                        for eidx, comp_dict in cext_results.items():
+                            for comp_name, np_arr in comp_dict.items():
+                                parts = comp_name.split(".")
+                                proj_name = parts[0]
+                                attr_name = parts[1]
+                                cext_io_bytes += np_arr.nbytes
+
+                                if np_arr.dtype == np.uint16:
+                                    # BF16: stored as uint16, convert to bfloat16
+                                    np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
+                                    mx_arr = mx.array(np_f32).astype(mx.bfloat16)
+                                else:
+                                    mx_arr = mx.array(np_arr)
+                                expert_cache.put_attr(i, eidx, proj_name, attr_name, mx_arr)
+                        cext_arr_time = time.time() - t_cext_arr
+
+                        token_io_bytes += cext_io_bytes
+                        token_io_seeks += len(uncached_list) * 9  # 9 components per expert
+                        token_io_time += cext_io_time
+                        token_array_time += cext_arr_time
+                        if profile:
+                            layer_io_bytes += cext_io_bytes
+
+                    elif use_pread and pread_index is not None:
+                        # pread()-based expert loading (bypasses safetensors)
+                        batch_results, io_stats = pread_expert_batch(
+                            pread_index, pread_fds, i, uncached_list)
+                        token_io_bytes += io_stats["bytes_read"]
+                        token_io_seeks += io_stats["seek_count"]
+                        token_io_time += io_stats["io_time_s"]
+                        token_array_time += io_stats["array_time_s"]
+                        if profile:
+                            layer_io_bytes += io_stats["bytes_read"]
+                        for eidx, attrs in batch_results.items():
                             for (proj_name, attr_name), arr in attrs.items():
                                 expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
+                    else:
+                        # Original safetensors path
+                        # Pre-populate header_cache for all expert files (thread-safe after this)
+                        for filepath in set(expert_file_map.values()):
+                            if filepath not in header_cache:
+                                header_cache[filepath] = parse_safetensors_header(filepath)
 
-            if profile:
-                t_io_done = time.perf_counter()
-                layer_io_ms = (t_io_done - t_io_start) * 1000
+                        # Parallel read: each thread reads all 9 attrs for one expert
+                        with ThreadPoolExecutor(max_workers=min(4, len(uncached_list))) as executor:
+                            futures = [
+                                executor.submit(
+                                    _read_single_expert_attrs,
+                                    expert_idx, i, expert_file_map, header_cache
+                                )
+                                for expert_idx in uncached_list
+                            ]
+                            for future in futures:
+                                eidx, attrs, io_stats = future.result()
+                                # Accumulate I/O stats from this expert read
+                                token_io_bytes += io_stats["bytes_read"]
+                                token_io_seeks += io_stats["seek_count"]
+                                token_io_time += io_stats["io_time_s"]
+                                token_array_time += io_stats["array_time_s"]
+                                if profile:
+                                    layer_io_bytes += io_stats["bytes_read"]
+                                for (proj_name, attr_name), arr in attrs.items():
+                                    expert_cache.put_attr(i, eidx, proj_name, attr_name, arr)
 
-            # Assemble [num_unique, ...] weight tensors into a dict for direct computation
-            expert_tensors = {}
-            for proj_name in ["gate_proj", "up_proj", "down_proj"]:
-                for attr_name in ["weight", "scales", "biases"]:
-                    slices = []
-                    for idx in unique_list:
-                        arr = expert_cache.get_attr(i, idx, proj_name, attr_name)
-                        if arr is not None:
-                            slices.append(arr)
-                        else:
-                            raise RuntimeError(
-                                f"Expert cache miss: layer={i} expert={idx} "
-                                f"{proj_name}.{attr_name} not found after loading"
-                            )
-                    if slices:
-                        expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+                if profile:
+                    t_io_done = time.perf_counter()
+                    layer_io_ms = (t_io_done - t_io_start) * 1000
 
+                # Assemble [num_unique, ...] weight tensors into a dict for direct computation
+                expert_tensors = {}
+                for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                    for attr_name in ["weight", "scales", "biases"]:
+                        slices = []
+                        for idx in unique_list:
+                            arr = expert_cache.get_attr(i, idx, proj_name, attr_name)
+                            if arr is not None:
+                                slices.append(arr)
+                            else:
+                                raise RuntimeError(
+                                    f"Expert cache miss: layer={i} expert={idx} "
+                                    f"{proj_name}.{attr_name} not found after loading"
+                                )
+                        if slices:
+                            expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+
+            # ---- MoE computation (shared by both paths) ----
             if batch_experts:
                 # Skip mx.eval(*expert_tensors.values()) — the stacked weight tensors
-                # are already concrete (from ExpertCache). Letting gather_qmm consume
-                # them directly avoids one Metal sync per layer. The mx.eval(h) below
+                # are already concrete (from ExpertCache or direct read). Letting gather_qmm
+                # consume them directly avoids one Metal sync per layer. The mx.eval(h) below
                 # evaluates the full MoE computation graph (stack + gather_qmm + activation)
                 # in a single fused Metal submission.
                 if profile:
@@ -1905,10 +1976,12 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     mx.eval(h)
                     token_moe_compute_time += time.time() - t_moe
 
-            # Clear protection now that experts are assembled and computed
-            expert_cache.unprotect()
+            # Clear protection / release expert tensors
+            if not no_expert_cache:
+                expert_cache.unprotect()
 
-            # Delete stacked expert tensors (they're copies from cache, not needed after compute).
+            # Delete stacked expert tensors (no-cache: lets mx.arrays be GC'd;
+            # cache path: they're copies from cache, not needed after compute).
             # The actual mx.clear_cache() is done once per token after all layers complete.
             del expert_tensors
 
@@ -2016,7 +2089,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         total_expert = sum(lt["expert_ms"] for lt in layer_timings)
         total_clear = batch_clear_time * 1000
 
-        cache_hr = expert_cache.hit_rate
+        cache_hr = expert_cache.hit_rate if expert_cache is not None else 0.0
 
         if token_idx == 0:
             ttft_ms = token_time * 1000
@@ -2162,10 +2235,11 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         "avg_attn_router_ms_per_token": avg_attn_router,
         "per_layer_load_ms": per_layer_load,
         "per_layer_compute_ms": per_layer_compute,
-        "expert_cache_hits": expert_cache.hits,
-        "expert_cache_misses": expert_cache.misses,
-        "expert_cache_hit_rate": expert_cache.hit_rate,
-        "expert_cache_entries": len(expert_cache.cache),
+        "expert_cache_hits": expert_cache.hits if expert_cache is not None else 0,
+        "expert_cache_misses": expert_cache.misses if expert_cache is not None else 0,
+        "expert_cache_hit_rate": expert_cache.hit_rate if expert_cache is not None else 0.0,
+        "expert_cache_entries": len(expert_cache.cache) if expert_cache is not None else 0,
+        "no_expert_cache": no_expert_cache,
         "avg_io_bytes_per_token": avg_bytes,
         "avg_io_seeks_per_token": avg_seeks,
         "avg_io_ms_per_token": avg_io_ms,
@@ -3451,6 +3525,11 @@ def main():
     parser.add_argument("--top-k", type=int, default=0,
                         help="Override number of active experts per token (0 = use model default). "
                              "Lower values reduce I/O at the cost of quality. Model default is 10.")
+    parser.add_argument("--no-expert-cache", action="store_true", default=False,
+                        help="Skip the explicit ExpertCache and rely on OS page cache for expert "
+                             "weight access. Reads ALL active experts from mmap'd safetensors per "
+                             "token (memcpy from page cache after warmup). Frees ~26GB Metal heap "
+                             "for OS page cache, trading per-token read volume for page-cache speed.")
     args = parser.parse_args()
 
     # Validate --cache-gb range
@@ -3508,15 +3587,20 @@ def main():
         # offload_selective variant runs router first, then loads only selected expert slices.
         print(f"[{fmt_time(time.time() - t_start)}] Using offload loader (no layer weights)...")
         model, tokenizer = load_model_no_weights(model_path)
-        # Cap wired memory — needs non-expert weights (~3-5GB) + expert cache
-        # With preloaded experts, cache may be larger than default 20GB
-        wired_gb = min(args.cache_gb + 8, args.max_mem_gb * 0.8, 43)
+        # Cap wired memory — needs non-expert weights (~3-5GB) + expert cache (if used)
+        # With --no-expert-cache, no Metal heap for experts; just non-expert + 5GB headroom.
+        if getattr(args, 'no_expert_cache', False) and args.mode == "offload_selective":
+            wired_gb = min(5 + 5, args.max_mem_gb * 0.8, 43)  # non-expert (~5GB) + 5GB headroom
+        else:
+            wired_gb = min(args.cache_gb + 8, args.max_mem_gb * 0.8, 43)
         mx.set_wired_limit(int(wired_gb * 1024**3))
         mode_note = ""
         if args.mode == "offload_lazy":
             mode_note = " [lazy_eval=True]"
         elif args.mode == "offload_selective":
             mode_note = " [selective expert loading]"
+            if getattr(args, 'no_expert_cache', False):
+                mode_note += " [no-expert-cache]"
         print(f"[{fmt_time(time.time() - t_start)}] Loaded (global weights only). "
               f"wired limit={wired_gb:.0f}GB{mode_note}")
     elif args.mode == "lazy":
@@ -3630,7 +3714,8 @@ def main():
                                             pread_fds=pread_fds,
                                             use_cext=args.use_cext,
                                             batch_experts=args.batch_experts,
-                                            top_k_override=args.top_k)
+                                            top_k_override=args.top_k,
+                                            no_expert_cache=args.no_expert_cache)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.
