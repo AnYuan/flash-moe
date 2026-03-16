@@ -9,3 +9,5 @@ a0063cc	Qwen3.5-122B-A10B-4bit	122.0	10.0	2.54	2157	10.2	keep	coalesced expert r
 bb0286e	Qwen3.5-122B-A10B-4bit	122.0	10.0	2.67	2100	17.0	keep	3072 LRU entries - 70% hit rate, 5% speedup
 HEAD	Qwen3.5-35B-A3B-4bit	5.4	3.0	36.95	841	14.5	keep	35B baseline (fits DRAM) - reference for speculative decoding
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.47	6305	20.6	keep	397B MOONSHOT - 209GB model on 48GB laptop, 23% cache hit at 5 tokens
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	0.96	6008	21.4	keep	397B 20-token run - 0.96 tok/s, 44% cache hit, still climbing
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.03	11341	21.4	keep	397B 50-token steady state - 1.03 tok/s, 50% cache hit, plateau reached
