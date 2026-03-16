@@ -1117,9 +1117,9 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     file_handle_cache = {}
 
     # === LRU cache for expert weight slices ===
-    # 1536 entries = 48 layers × 8 experts × 4 tokens worth. ~7.6GB max.
-    # Better tok/s per GB of memory than 3072 entries.
-    expert_cache = ExpertCache(max_entries=1536)
+    # 3072 entries = 48 layers × 8 experts × 8 tokens worth. ~15.2GB max.
+    # ~5% faster than 1536 entries (2.67 vs 2.54 tok/s) at cost of higher memory.
+    expert_cache = ExpertCache(max_entries=3072)
 
     # === Cache quantization parameters from model config (read once) ===
     # These are needed by compute_moe_direct for mx.gather_qmm calls.
