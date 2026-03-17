@@ -1,4 +1,4 @@
-"""Build script for fast_expert_io C extension."""
+"""Build script for fast_expert_io and fast_weight_load C extensions."""
 
 from setuptools import setup, Extension
 import numpy as np
@@ -20,9 +20,24 @@ fast_expert_io = Extension(
     ],
 )
 
+fast_weight_load = Extension(
+    'fast_weight_load',
+    sources=['fast_weight_load.c'],
+    extra_compile_args=[
+        '-O3',
+        '-march=armv8.4-a',
+        '-flto',
+        '-Wno-deprecated-declarations',
+    ],
+    extra_link_args=[
+        '-lpthread',
+        '-flto',
+    ],
+)
+
 setup(
-    name='fast_expert_io',
-    version='0.1.0',
-    description='High-throughput expert weight I/O via preadv + pthreads',
-    ext_modules=[fast_expert_io],
+    name='ane_research_cext',
+    version='0.2.0',
+    description='High-throughput expert weight I/O C extensions',
+    ext_modules=[fast_expert_io, fast_weight_load],
 )
