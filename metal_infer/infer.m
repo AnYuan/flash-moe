@@ -166,12 +166,118 @@ static int g_timing_enabled = 0;
 static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
+static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 
 // Active expert size based on quantization mode
 static inline size_t active_expert_size(void) {
     return g_use_2bit ? EXPERT_SIZE_2BIT : EXPERT_SIZE;
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
+
+typedef struct {
+    uint64_t token_clock;
+    uint64_t unique_experts_touched;
+    uint64_t cold_misses;
+    uint64_t eviction_misses;
+    uint64_t evictions;
+    uint64_t reuse_le_1;
+    uint64_t reuse_le_4;
+    uint64_t reuse_le_16;
+    uint64_t reuse_le_64;
+    uint64_t reuse_gt_64;
+    uint64_t reuse_distance_sum;
+    uint64_t reuse_distance_samples;
+} CacheTelemetry;
+
+static CacheTelemetry g_cache_telemetry = {0};
+static uint8_t g_cache_seen[NUM_LAYERS][NUM_EXPERTS];
+static uint64_t g_cache_last_touch_token[NUM_LAYERS][NUM_EXPERTS];
+static uint64_t g_cache_last_evict_token[NUM_LAYERS][NUM_EXPERTS];
+
+static void cache_telemetry_reset(void) {
+    memset(&g_cache_telemetry, 0, sizeof(g_cache_telemetry));
+    memset(g_cache_seen, 0, sizeof(g_cache_seen));
+    memset(g_cache_last_touch_token, 0, sizeof(g_cache_last_touch_token));
+    memset(g_cache_last_evict_token, 0, sizeof(g_cache_last_evict_token));
+}
+
+static void cache_telemetry_note_token(void) {
+    if (!g_cache_telemetry_enabled) return;
+    g_cache_telemetry.token_clock++;
+}
+
+static void cache_telemetry_touch(int layer_idx, int expert_idx) {
+    if (!g_cache_telemetry_enabled) return;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS || expert_idx < 0 || expert_idx >= NUM_EXPERTS) return;
+    if (!g_cache_seen[layer_idx][expert_idx]) {
+        g_cache_seen[layer_idx][expert_idx] = 1;
+        g_cache_telemetry.unique_experts_touched++;
+    }
+    g_cache_last_touch_token[layer_idx][expert_idx] = g_cache_telemetry.token_clock;
+}
+
+static void cache_telemetry_miss(int layer_idx, int expert_idx) {
+    if (!g_cache_telemetry_enabled) return;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS || expert_idx < 0 || expert_idx >= NUM_EXPERTS) return;
+    if (!g_cache_seen[layer_idx][expert_idx]) {
+        g_cache_telemetry.cold_misses++;
+        g_cache_seen[layer_idx][expert_idx] = 1;
+        g_cache_telemetry.unique_experts_touched++;
+    } else {
+        g_cache_telemetry.eviction_misses++;
+        uint64_t dist = 0;
+        if (g_cache_last_evict_token[layer_idx][expert_idx] > 0 &&
+            g_cache_telemetry.token_clock >= g_cache_last_evict_token[layer_idx][expert_idx]) {
+            dist = g_cache_telemetry.token_clock - g_cache_last_evict_token[layer_idx][expert_idx];
+        }
+        if (dist <= 1) g_cache_telemetry.reuse_le_1++;
+        else if (dist <= 4) g_cache_telemetry.reuse_le_4++;
+        else if (dist <= 16) g_cache_telemetry.reuse_le_16++;
+        else if (dist <= 64) g_cache_telemetry.reuse_le_64++;
+        else g_cache_telemetry.reuse_gt_64++;
+        g_cache_telemetry.reuse_distance_sum += dist;
+        g_cache_telemetry.reuse_distance_samples++;
+    }
+    g_cache_last_touch_token[layer_idx][expert_idx] = g_cache_telemetry.token_clock;
+}
+
+static void cache_telemetry_evict(int layer_idx, int expert_idx) {
+    if (!g_cache_telemetry_enabled) return;
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS || expert_idx < 0 || expert_idx >= NUM_EXPERTS) return;
+    g_cache_telemetry.evictions++;
+    g_cache_last_evict_token[layer_idx][expert_idx] = g_cache_telemetry.token_clock;
+}
+
+static void cache_telemetry_print(uint64_t hits, uint64_t misses) {
+    if (!g_cache_telemetry_enabled) return;
+    uint64_t total = hits + misses;
+    fprintf(stderr, "\n=== Cache Telemetry ===\n");
+    fprintf(stderr, "Tokens tracked: %llu\n", g_cache_telemetry.token_clock);
+    fprintf(stderr, "Unique experts touched: %llu / %d (%.1f%%)\n",
+            g_cache_telemetry.unique_experts_touched,
+            NUM_LAYERS * NUM_EXPERTS,
+            100.0 * g_cache_telemetry.unique_experts_touched / (NUM_LAYERS * NUM_EXPERTS));
+    fprintf(stderr, "Miss breakdown: cold %llu (%.1f%% of misses), eviction %llu (%.1f%% of misses)\n",
+            g_cache_telemetry.cold_misses,
+            misses > 0 ? 100.0 * g_cache_telemetry.cold_misses / misses : 0.0,
+            g_cache_telemetry.eviction_misses,
+            misses > 0 ? 100.0 * g_cache_telemetry.eviction_misses / misses : 0.0);
+    fprintf(stderr, "Evictions: %llu\n", g_cache_telemetry.evictions);
+    fprintf(stderr, "Eviction reuse distance: <=1 tok %llu, <=4 %llu, <=16 %llu, <=64 %llu, >64 %llu",
+            g_cache_telemetry.reuse_le_1,
+            g_cache_telemetry.reuse_le_4,
+            g_cache_telemetry.reuse_le_16,
+            g_cache_telemetry.reuse_le_64,
+            g_cache_telemetry.reuse_gt_64);
+    if (g_cache_telemetry.reuse_distance_samples > 0) {
+        fprintf(stderr, " (avg %.1f tok)\n",
+                (double)g_cache_telemetry.reuse_distance_sum / g_cache_telemetry.reuse_distance_samples);
+    } else {
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "Effective hit rate: %.1f%%\n",
+            total > 0 ? 100.0 * hits / total : 0.0);
+}
 
 static void timing_reset(void) {
     memset(&g_timing, 0, sizeof(g_timing));
@@ -2982,6 +3088,8 @@ typedef struct {
     ExpertCacheEntry *entries;
     int max_entries;
     int num_entries;
+    int used_entries;
+    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
     uint64_t access_counter; // monotonic, incremented on every access
     id<MTLDevice> device;    // for allocating new Metal buffers
     // Stats
@@ -3001,10 +3109,16 @@ static ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
     cache->entries = calloc(max_entries, sizeof(ExpertCacheEntry));
     cache->max_entries = max_entries;
     cache->num_entries = 0;
+    cache->used_entries = 0;
     cache->access_counter = 0;
     cache->device = device;
     cache->hits = 0;
     cache->misses = 0;
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        for (int e = 0; e < NUM_EXPERTS; e++) {
+            cache->entry_idx[l][e] = -1;
+        }
+    }
     // Pre-allocate ALL Metal buffers at startup (avoids allocation overhead at runtime)
     size_t esz = active_expert_size();
     double t_prealloc = now_ms();
@@ -3041,15 +3155,15 @@ static void expert_cache_free(ExpertLRUCache *cache) {
 // Lookup: returns the cached Metal buffer if found, otherwise NULL.
 // On hit, updates the LRU timestamp.
 static id<MTLBuffer> expert_cache_lookup(ExpertLRUCache *cache, int layer_idx, int expert_idx) {
-    for (int i = 0; i < cache->num_entries; i++) {
-        if (cache->entries[i].layer_idx == layer_idx &&
-            cache->entries[i].expert_idx == expert_idx) {
-            cache->entries[i].last_used = ++cache->access_counter;
-            cache->hits++;
-            return cache->entries[i].buffer;
-        }
+    int idx = cache->entry_idx[layer_idx][expert_idx];
+    if (idx >= 0) {
+        cache->entries[idx].last_used = ++cache->access_counter;
+        cache->hits++;
+        cache_telemetry_touch(layer_idx, expert_idx);
+        return cache->entries[idx].buffer;
     }
     cache->misses++;
+    cache_telemetry_miss(layer_idx, expert_idx);
     return nil;
 }
 
@@ -3058,13 +3172,16 @@ static id<MTLBuffer> expert_cache_lookup(ExpertLRUCache *cache, int layer_idx, i
 static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, int expert_idx) {
     id<MTLBuffer> buf = nil;
 
+    int existing = cache->entry_idx[layer_idx][expert_idx];
+    if (existing >= 0) {
+        cache->entries[existing].last_used = ++cache->access_counter;
+        return cache->entries[existing].buffer;
+    }
+
     // Find a slot: first try an unused slot (layer_idx == -1), then LRU evict
     int target = -1;
-    for (int i = 0; i < cache->num_entries; i++) {
-        if (cache->entries[i].layer_idx == -1) {
-            target = i;
-            break;
-        }
+    if (cache->used_entries < cache->num_entries) {
+        target = cache->used_entries++;
     }
     if (target >= 0) {
         // Unused pre-allocated slot
@@ -3072,6 +3189,7 @@ static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, i
         cache->entries[target].layer_idx = layer_idx;
         cache->entries[target].expert_idx = expert_idx;
         cache->entries[target].last_used = ++cache->access_counter;
+        cache->entry_idx[layer_idx][expert_idx] = target;
         return buf;
     }
 
@@ -3086,10 +3204,17 @@ static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, i
     }
 
     // Reuse the evicted entry's Metal buffer (same size, no realloc needed)
+    int old_layer = cache->entries[lru_idx].layer_idx;
+    int old_expert = cache->entries[lru_idx].expert_idx;
+    cache_telemetry_evict(old_layer, old_expert);
+    if (old_layer >= 0 && old_expert >= 0) {
+        cache->entry_idx[old_layer][old_expert] = -1;
+    }
     buf = cache->entries[lru_idx].buffer;
     cache->entries[lru_idx].layer_idx = layer_idx;
     cache->entries[lru_idx].expert_idx = expert_idx;
     cache->entries[lru_idx].last_used = ++cache->access_counter;
+    cache->entry_idx[layer_idx][expert_idx] = lru_idx;
     return buf;
 }
 
@@ -3108,6 +3233,8 @@ typedef struct {
     uint64_t *last_used;   // [max_entries] monotonic counter for LRU
     int max_entries;
     int num_entries;
+    int used_entries;
+    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
     uint64_t access_counter;
     uint64_t hits;
     uint64_t misses;
@@ -3124,9 +3251,15 @@ static MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> devic
     cache->last_used = calloc(max_entries, sizeof(uint64_t));
     cache->max_entries = max_entries;
     cache->num_entries = 0;
+    cache->used_entries = 0;
     cache->access_counter = 0;
     cache->hits = 0;
     cache->misses = 0;
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        for (int e = 0; e < NUM_EXPERTS; e++) {
+            cache->entry_idx[l][e] = -1;
+        }
+    }
 
     size_t esz = active_expert_size();
     printf("[malloc_cache] Initializing: %d entries (%.1f GB) with zero-copy Metal wrappers\n",
@@ -3168,27 +3301,32 @@ static MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> devic
 
 // Lookup: returns Metal buffer wrapping cached data, or nil. Zero-copy dispatch.
 static id<MTLBuffer> malloc_cache_lookup(MallocExpertCache *cache, int layer, int expert) {
-    for (int i = 0; i < cache->num_entries; i++) {
-        if (cache->layer_idx[i] == layer && cache->expert_idx[i] == expert) {
-            cache->last_used[i] = ++cache->access_counter;
-            cache->hits++;
-            return cache->metal_bufs[i];
-        }
+    int idx = cache->entry_idx[layer][expert];
+    if (idx >= 0) {
+        cache->last_used[idx] = ++cache->access_counter;
+        cache->hits++;
+        cache_telemetry_touch(layer, expert);
+        return cache->metal_bufs[idx];
     }
     cache->misses++;
+    cache_telemetry_miss(layer, expert);
     return nil;
 }
 
 // Insert: evict LRU if needed, return entry index for pread target.
 // Returns the Metal buffer for this entry (caller should pread into cache->data[idx]).
 static id<MTLBuffer> malloc_cache_insert(MallocExpertCache *cache, int layer, int expert, int *out_idx) {
+    int existing = cache->entry_idx[layer][expert];
+    if (existing >= 0) {
+        cache->last_used[existing] = ++cache->access_counter;
+        if (out_idx) *out_idx = existing;
+        return cache->metal_bufs[existing];
+    }
+
     // Find a free slot (layer_idx == -1) or evict LRU
     int target = -1;
-    for (int i = 0; i < cache->num_entries; i++) {
-        if (cache->layer_idx[i] == -1) {
-            target = i;
-            break;
-        }
+    if (cache->used_entries < cache->num_entries) {
+        target = cache->used_entries++;
     }
 
     if (target < 0) {
@@ -3201,11 +3339,16 @@ static id<MTLBuffer> malloc_cache_insert(MallocExpertCache *cache, int layer, in
                 target = i;
             }
         }
+        cache_telemetry_evict(cache->layer_idx[target], cache->expert_idx[target]);
+        if (cache->layer_idx[target] >= 0 && cache->expert_idx[target] >= 0) {
+            cache->entry_idx[cache->layer_idx[target]][cache->expert_idx[target]] = -1;
+        }
     }
 
     cache->layer_idx[target] = layer;
     cache->expert_idx[target] = expert;
     cache->last_used[target] = ++cache->access_counter;
+    cache->entry_idx[layer][expert] = target;
     if (out_idx) *out_idx = target;
     return cache->metal_bufs[target];
 }
@@ -5537,6 +5680,7 @@ static void serve_loop(
                 }
             }
             reset_delta_net_state();
+            if (g_cache_telemetry_enabled) cache_telemetry_reset();
             int pos = 0;
 
             // ---- Send SSE headers ----
@@ -5545,6 +5689,7 @@ static void serve_loop(
             // ---- Prefill ----
             double t_prefill = now_ms();
             for (int i = 0; i < pt->count; i++) {
+                cache_telemetry_note_token();
                 embed_lookup(wf, pt->ids[i], hidden);
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
                     int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
@@ -5584,6 +5729,7 @@ static void serve_loop(
                 gen_count++;
 
                 // Generate next
+                cache_telemetry_note_token();
                 embed_lookup(wf, next_token, hidden);
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
                     int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
@@ -5613,6 +5759,11 @@ static void serve_loop(
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
                     request_id, gen_count, gen_ms,
                     gen_count > 0 ? gen_count * 1000.0 / gen_ms : 0.0);
+            if (g_expert_cache) {
+                cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
+            } else if (g_malloc_cache) {
+                cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
+            }
 
             free(pt->ids);
             free(pt);
@@ -5647,11 +5798,12 @@ static void print_usage(const char *prog) {
     printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
     printf("  --k N                Active experts per layer (default: 4)\n");
-    printf("  --cache-entries N    Expert LRU cache size (default: 1500, 0 = disabled)\n");
+    printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
+    printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
@@ -5668,7 +5820,7 @@ int main(int argc, char **argv) {
         const char *prompt_text = NULL;
         int max_tokens = 20;
         int K = 4;
-        int cache_entries = 1500;  // default 1500 entries (override with --cache-entries)
+        int cache_entries = 2500;  // default 2500 entries (override with --cache-entries)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 
@@ -5687,6 +5839,7 @@ int main(int argc, char **argv) {
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
             {"freq",          no_argument,       0, 'F'},
+            {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"serve",         required_argument, 0, 'R'},
@@ -5695,7 +5848,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:LSTF2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -5711,6 +5864,7 @@ int main(int argc, char **argv) {
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
+                case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'R': serve_port = atoi(optarg); break;
@@ -5931,6 +6085,7 @@ int main(int argc, char **argv) {
 
         // ---- Generate tokens ----
         reset_delta_net_state();  // zero GPU delta-net state before generation
+        if (g_cache_telemetry_enabled) cache_telemetry_reset();
         printf("--- Generating %d tokens ---\n", max_tokens);
         int pos = 0;  // position counter for RoPE
 
@@ -5947,6 +6102,7 @@ int main(int argc, char **argv) {
             }
 
             // ---- Embedding ----
+            cache_telemetry_note_token();
             embed_lookup(wf, current_token, hidden);
 
             // ---- 60 Transformer layers (fused: 1+K cmd buffers per layer) ----
@@ -6030,6 +6186,7 @@ int main(int argc, char **argv) {
             }
 
             // Embed the just-generated token (next iteration)
+            cache_telemetry_note_token();
             embed_lookup(wf, next_token, hidden);
 
             // Run 60 layers (fused: 1+K cmd buffers per layer)
@@ -6091,6 +6248,14 @@ int main(int argc, char **argv) {
                    g_expert_cache->hits, g_expert_cache->misses,
                    total > 0 ? 100.0 * g_expert_cache->hits / total : 0.0,
                    g_expert_cache->num_entries, g_expert_cache->max_entries);
+            cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
+        } else if (g_malloc_cache) {
+            uint64_t total = g_malloc_cache->hits + g_malloc_cache->misses;
+            printf("Expert cache:   malloc %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
+                   g_malloc_cache->hits, g_malloc_cache->misses,
+                   total > 0 ? 100.0 * g_malloc_cache->hits / total : 0.0,
+                   g_malloc_cache->num_entries, g_malloc_cache->max_entries);
+            cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
         }
 
         if (g_spec_route_attempts > 0) {
