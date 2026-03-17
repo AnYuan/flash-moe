@@ -964,3 +964,53 @@ kernel void conv1d_step(
     conv_state[1 * conv_dim + idx] = conv_state[2 * conv_dim + idx];
     conv_state[2 * conv_dim + idx] = inp;
 }
+
+
+// ============================================================================
+// Kernel 12: MoE combine + residual + shared expert gate (fused)
+// ============================================================================
+// Fused operation for CMD3 GPU-side combine:
+//   hidden[i] = h_mid[i] + sum_k(expert_weight[k] * expert_out[k][i])
+//               + sigmoid(shared_gate_score) * shared_out[i]
+//
+// All 8 expert output buffers are always bound (unused ones have weight=0).
+// This avoids variable buffer bindings and keeps the dispatch simple.
+//
+// Dispatch: (dim + 255) / 256 threadgroups, 256 threads each.
+
+kernel void moe_combine_residual(
+    device const float* h_mid       [[buffer(0)]],   // [dim]
+    device const float* shared_out  [[buffer(1)]],   // [dim]
+    device float*       hidden_out  [[buffer(2)]],   // [dim] output
+    device const float* expert_out0 [[buffer(3)]],   // [dim] expert 0
+    device const float* expert_out1 [[buffer(4)]],   // [dim] expert 1
+    device const float* expert_out2 [[buffer(5)]],   // [dim] expert 2
+    device const float* expert_out3 [[buffer(6)]],   // [dim] expert 3
+    device const float* expert_out4 [[buffer(7)]],   // [dim] expert 4
+    device const float* expert_out5 [[buffer(8)]],   // [dim] expert 5
+    device const float* expert_out6 [[buffer(9)]],   // [dim] expert 6
+    device const float* expert_out7 [[buffer(10)]],  // [dim] expert 7
+    device const float* params      [[buffer(11)]],  // [10]: weights[0..7], shared_gate_score, (unused)
+    constant uint&      dim         [[buffer(12)]],
+    constant uint&      K           [[buffer(13)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+
+    // Read expert weights and shared gate from params buffer
+    float shared_gate = 1.0f / (1.0f + exp(-params[8]));  // sigmoid(shared_gate_score)
+
+    // Weighted sum of expert outputs
+    float moe = 0.0f;
+    // Unrolled for MAX_K=8 with branch on K to avoid reading invalid buffers
+    if (K > 0) moe += params[0] * expert_out0[tid];
+    if (K > 1) moe += params[1] * expert_out1[tid];
+    if (K > 2) moe += params[2] * expert_out2[tid];
+    if (K > 3) moe += params[3] * expert_out3[tid];
+    if (K > 4) moe += params[4] * expert_out4[tid];
+    if (K > 5) moe += params[5] * expert_out5[tid];
+    if (K > 6) moe += params[6] * expert_out6[tid];
+    if (K > 7) moe += params[7] * expert_out7[tid];
+
+    hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
+}

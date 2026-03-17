@@ -6,3 +6,4 @@ HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.10	0	5.5	discard	Malloc zero-copy cache
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.77	0	5.5	discard	Malloc zero-copy cache 500 entries (3.5GB): 37% hit, still slower than Metal LRU (2.93 vs 3.14)
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	1.70	0	5.5	discard	Speculative early routing: 53% prediction accuracy but cache pollution + overhead = 38% slower
 HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.67	0	5.5	discard	F_RDADVISE kernel hints: no improvement, added syscall overhead
+HEAD	Qwen3.5-397B-A17B-4bit	397.0	17.0	2.75	0	5.5	keep	GPU combine+norm in CMD3: deferred_wait eliminated (0.83->0ms) but absorbed into cmd1_wait (0.49->1.78ms). Cleaner pipeline.
