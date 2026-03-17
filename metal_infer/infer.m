@@ -110,7 +110,7 @@
 #define DOWN_B_OFF_2  3801088
 
 // KV cache maximum context length
-#define MAX_SEQ_LEN 4096
+#define MAX_SEQ_LEN 32768  // 32K context — only 15 full-attn layers need KV cache (~480MB)
 
 // EOS token
 #define EOS_TOKEN_1         248046

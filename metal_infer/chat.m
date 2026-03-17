@@ -22,7 +22,7 @@
 #define NEWLINE_TOKEN   198     // \n
 
 // Maximum conversation length in tokens
-#define MAX_CONV_TOKENS 3072
+#define MAX_CONV_TOKENS 32768  // matches MAX_SEQ_LEN — only ~480MB for 15 full-attn KV caches
 // Maximum input line length
 #define MAX_INPUT_LINE  4096
 // Maximum tokens per response
