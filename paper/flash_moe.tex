@@ -283,27 +283,8 @@ Third, the final ``Trust OS'' configuration demonstrates that removing \emph{all
 
 \subsection{Per-Layer Breakdown}
 
-Table~\ref{tab:breakdown} shows the average time budget per layer at the final 2-bit + OS page cache configuration.
-Expert I/O dominates at 48\% of per-layer time, followed by GPU command buffer synchronization (CMD1 wait at 28\%), CMD2 wait at 15\%, and CPU attention at 9\%.
-
-\begin{table}[h!]
-\centering
-\caption{Per-layer time breakdown (2-bit, OS page cache). Total: 2.9\,ms/layer $\times$ 60 = 174\,ms/token $\approx$ 5.7\,tok/s.}
-\label{tab:breakdown}
-\begin{tabular}{lrr}
-\toprule
-\textbf{Phase} & \textbf{Time (ms)} & \textbf{\% of total} \\
-\midrule
-Expert I/O (parallel \texttt{pread}) & 1.37 & 47\% \\
-CMD1 wait (GPU projections + CMD3) & 0.87 & 30\% \\
-CMD2 wait (GPU routing + shared) & 0.45 & 15\% \\
-CPU attention (BLAS delta-net) & 0.15 & 5\% \\
-Other (encode, submit, routing) & 0.06 & 2\% \\
-\midrule
-\textbf{Total per layer} & \textbf{2.90} & \textbf{100\%} \\
-\bottomrule
-\end{tabular}
-\end{table}
+The average per-layer time budget at the final 2-bit + OS page cache configuration (2.9\,ms/layer $\times$ 60 = 174\,ms/token $\approx$ 5.7\,tok/s) breaks down as follows: \textbf{Expert I/O} via parallel \texttt{pread()}: 1.37\,ms (47\%); \textbf{CMD1 wait} (GPU projections + deferred CMD3): 0.87\,ms (30\%); \textbf{CMD2 wait} (GPU routing + shared expert): 0.45\,ms (15\%); \textbf{CPU attention} (BLAS-accelerated GatedDeltaNet): 0.15\,ms (5\%); other overhead: 0.06\,ms (2\%).
+Expert I/O dominates, consuming nearly half of the per-layer budget.
 
 The I/O cost of 1.49\,ms per layer corresponds to reading $\sim$15.7\,MB of expert data (4 experts $\times$ 3.93\,MB) at an effective rate of 10.5\,GB/s---below the SSD's 17.5\,GB/s peak but consistent with the overhead of 4 scattered \texttt{pread()} calls rather than a single sequential read.
 
