@@ -1,108 +1,110 @@
 """
-progress.py — Visualize autoresearch experiment progress.
-Reads results.tsv, generates progress.png and prints text summary.
+progress.py — Visualize Flash-MoE experiment progress.
+Reads results.tsv, generates progress.png focused on the 397B model journey.
 
 Usage:
-    uv run progress.py
+    pip install pandas matplotlib
+    python progress.py
 """
 
 import sys
 import os
-
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 
 
 def main():
-    tsv_path = "results.tsv"
-    if not os.path.exists(tsv_path):
-        print("No results.tsv found. Run some experiments first.")
+    # Load both results files
+    dfs = []
+    for path in ["results.tsv", "metal_infer/results.tsv"]:
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path, sep="\t")
+                dfs.append(df)
+            except Exception:
+                pass
+    if not dfs:
+        print("No results.tsv found.")
         sys.exit(0)
 
-    df = pd.read_csv(tsv_path, sep="\t")
-    if len(df) == 0:
-        print("results.tsv is empty.")
-        sys.exit(0)
-
+    df = pd.concat(dfs, ignore_index=True)
     df["tok_sec"] = pd.to_numeric(df["tok_sec"], errors="coerce")
     df["params_B"] = pd.to_numeric(df["params_B"], errors="coerce")
-    df["active_B"] = pd.to_numeric(df["active_B"], errors="coerce")
     df["mem_gb"] = pd.to_numeric(df["mem_gb"], errors="coerce")
     df["status"] = df["status"].str.strip().str.lower()
 
+    # Split into 397B (the main story) and other (context)
+    is_397b = df["params_B"] >= 300  # 397B model
+    df_397b = df[is_397b].copy()
+    df_other = df[~is_397b].copy()
+
     n_total = len(df)
-    n_keep = len(df[df["status"] == "keep"])
-    n_discard = len(df[df["status"] == "discard"])
-    n_crash = len(df[df["status"] == "crash"])
+    n_397b = len(df_397b)
+    kept_397b = df_397b[df_397b["status"] == "keep"]
 
-    # Text summary
-    print(f"\n=== Autoresearch Progress ===")
-    print(f"Experiments: {n_total} ({n_keep} keep, {n_discard} discard, {n_crash} crash)")
+    print(f"\n=== Flash-MoE: 397B Model Journey ===")
+    print(f"Total experiments: {n_total} ({n_397b} on 397B, {len(df_other)} on smaller models)")
 
-    kept = df[df["status"] == "keep"]
-    if len(kept) > 0:
-        best_row = kept.loc[kept["params_B"].idxmax()]
-        print(f"Biggest kept: {best_row['model']} — {best_row['params_B']:.0f}B params, "
-              f"{best_row.get('active_B', '?')}B active, {best_row['tok_sec']:.1f} tok/s, "
-              f"{best_row['mem_gb']:.1f} GB peak")
+    if len(kept_397b) > 0:
+        best = kept_397b.loc[kept_397b["tok_sec"].idxmax()]
+        print(f"Best 397B result: {best['tok_sec']:.1f} tok/s — {best['description'][:80]}")
 
-        fastest_row = kept.loc[kept["tok_sec"].idxmax()]
-        print(f"Fastest kept: {fastest_row['model']} — {fastest_row['tok_sec']:.1f} tok/s, "
-              f"{fastest_row['params_B']:.0f}B params")
+    # ---- Plot ----
+    fig, ax = plt.subplots(figsize=(16, 7))
 
-    print(f"\nAll experiments:")
-    for i, row in df.iterrows():
-        status_icon = {"keep": "+", "discard": "-", "crash": "X"}.get(row["status"], "?")
-        print(f"  [{status_icon}] #{i+1:3d}  {row['model']:40s}  "
-              f"{row['tok_sec']:6.1f} tok/s  {row['mem_gb']:5.1f}GB  {row['description']}")
-
-    # Plot
-    if n_total < 2:
-        print("\nNeed at least 2 experiments for a chart.")
-        return
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=True,
-                                    gridspec_kw={"height_ratios": [2, 1]})
-
-    x = range(1, n_total + 1)
-
-    # Top: tok/sec by experiment
-    colors = {"keep": "#2ecc71", "discard": "#95a5a6", "crash": "#e74c3c"}
-    for status in ["discard", "crash", "keep"]:
-        mask = df["status"] == status
+    # Plot 397B experiments (the main story)
+    colors_397b = {"keep": "#2ecc71", "discard": "#e74c3c"}
+    for status in ["discard", "keep"]:
+        mask = (df_397b["status"] == status) & (df_397b["tok_sec"] > 0)
         if mask.any():
-            ax1.scatter([i+1 for i in df.index[mask]], df.loc[mask, "tok_sec"],
-                       c=colors.get(status, "#333"), s=60 if status == "keep" else 25,
-                       label=status.title(), zorder=4 if status == "keep" else 2,
+            subset = df_397b[mask]
+            ax.scatter(range(len(subset.index)), subset["tok_sec"],
+                       c=colors_397b.get(status, "#999"),
+                       s=80 if status == "keep" else 30,
+                       label=f"397B {status}" if status == "keep" else "397B discarded",
+                       zorder=5 if status == "keep" else 3,
                        edgecolors="black" if status == "keep" else "none",
-                       linewidths=0.5)
+                       linewidths=0.5, alpha=0.9 if status == "keep" else 0.4)
 
-    # Running best tok/sec for kept experiments
-    if n_keep > 1:
-        kept_sorted = df[df["status"] == "keep"].copy()
-        running_best = kept_sorted["tok_sec"].cummax()
-        ax1.step([i+1 for i in kept_sorted.index], running_best,
-                where="post", color="#27ae60", linewidth=2, alpha=0.7, label="Running best")
+    # Running best line for 397B kept experiments
+    kept_nonzero = kept_397b[kept_397b["tok_sec"] > 0].copy()
+    if len(kept_nonzero) > 1:
+        running_best = kept_nonzero["tok_sec"].cummax()
+        x_kept = []
+        idx = 0
+        for i, row in df_397b.iterrows():
+            if row["status"] == "keep" and row["tok_sec"] > 0:
+                x_kept.append(idx)
+            if row["tok_sec"] > 0:
+                idx += 1
+        if len(x_kept) == len(running_best):
+            ax.step(x_kept, running_best.values,
+                    where="post", color="#27ae60", linewidth=2.5, alpha=0.8,
+                    label="Running best (397B)")
 
-    ax1.set_ylabel("tok/sec (higher is better)", fontsize=11)
-    ax1.legend(loc="upper left", fontsize=9)
-    ax1.grid(True, alpha=0.2)
-    ax1.set_title(f"Autoresearch Progress: {n_total} Experiments", fontsize=13)
+    # Annotate key milestones
+    milestones = [
+        ("CPU-only\n0.28 tok/s", 0.28),
+        ("GPU matmuls\n1.85 tok/s", 1.85),
+        ("Fused pipeline\n5.29 tok/s", 5.29),
+        ("2-bit experts\n5.55 tok/s", 5.55),
+        ("Trust OS cache\n5.74 tok/s", 5.74),
+    ]
 
-    # Bottom: model size
-    for status in ["discard", "crash", "keep"]:
-        mask = df["status"] == status
-        if mask.any():
-            ax2.scatter([i+1 for i in df.index[mask]], df.loc[mask, "params_B"],
-                       c=colors.get(status, "#333"), s=60 if status == "keep" else 25,
-                       zorder=4 if status == "keep" else 2,
-                       edgecolors="black" if status == "keep" else "none",
-                       linewidths=0.5)
+    ax.set_ylabel("Tokens/second", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Experiment # (397B model only)", fontsize=12)
+    ax.set_title("Flash-MoE: Running a 397B Model on a Laptop\n"
+                 "From 0.28 tok/s to 5.7 tok/s through 90+ experiments",
+                 fontsize=14, fontweight="bold")
+    ax.legend(loc="upper left", fontsize=10)
+    ax.grid(True, alpha=0.2)
+    ax.set_ylim(bottom=-0.5)
 
-    ax2.set_ylabel("Model Size (B params)", fontsize=11)
-    ax2.set_xlabel("Experiment #", fontsize=11)
-    ax2.grid(True, alpha=0.2)
+    # Add phase annotations
+    ax.axhline(y=5.74, color="#27ae60", linestyle="--", alpha=0.3, linewidth=1)
+    ax.text(0.98, 5.74, "  5.74 tok/s (current best)", transform=ax.get_yaxis_transform(),
+            va="bottom", ha="right", fontsize=9, color="#27ae60", alpha=0.7)
 
     plt.tight_layout()
     plt.savefig("progress.png", dpi=150, bbox_inches="tight")
