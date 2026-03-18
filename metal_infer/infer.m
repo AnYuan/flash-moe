@@ -5529,7 +5529,8 @@ static const char *CORS_RESPONSE =
 // Writes binary token file and loads it. Caller must free returned PromptTokens.
 static PromptTokens *tokenize_chat_message(const char *user_content) {
     const char *prefix =
-        "<|im_start|>system\nYou are a helpful assistant. /think<|im_end|>\n"
+        "<|im_start|>system\nYou are a helpful assistant. /think\n"
+        "Keep your thinking concise and focused — aim for under 300 words in your <think> block before responding.<|im_end|>\n"
         "<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
