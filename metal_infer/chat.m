@@ -71,6 +71,10 @@ static void session_path(const char *session_id, char *path, size_t pathsize) {
     snprintf(path, pathsize, "%s/%s.jsonl", g_sessions_dir, session_id);
 }
 
+static void session_meta_path(const char *session_id, char *path, size_t pathsize) {
+    snprintf(path, pathsize, "%s/%s.server", g_sessions_dir, session_id);
+}
+
 // Append a turn to the session JSONL file
 static void session_save_turn(const char *session_id, const char *role, const char *content) {
     char path[1024];
@@ -84,57 +88,73 @@ static void session_save_turn(const char *session_id, const char *role, const ch
 }
 
 // Load session history and replay to screen
-static int session_load(const char *session_id) {
+static NSArray *session_load_messages(const char *session_id) {
     char path[1024];
     session_path(session_id, path, sizeof(path));
     FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    if (!f) return nil;
 
-    printf("[resuming session %s]\n\n", session_id);
-    int turns = 0;
+    NSMutableArray *messages = [NSMutableArray array];
     char line[MAX_RESPONSE];
     while (fgets(line, sizeof(line), f)) {
-        // Simple parsing: find role and content
-        char *role_start = strstr(line, "\"role\":\"");
-        char *content_start = strstr(line, "\"content\":\"");
-        if (!role_start || !content_start) continue;
-
-        role_start += 8;
-        char role[32]; int ri = 0;
-        while (*role_start && *role_start != '"' && ri < 31) role[ri++] = *role_start++;
-        role[ri] = 0;
-
-        content_start += 11;
-        // Decode the content (unescape)
-        char content[MAX_RESPONSE]; int ci = 0;
-        for (int i = 0; content_start[i] && ci < MAX_RESPONSE - 1; i++) {
-            // Stop at closing quote (not escaped)
-            if (content_start[i] == '"' && (i == 0 || content_start[i-1] != '\\')) break;
-            if (content_start[i] == '\\' && content_start[i+1]) {
-                i++;
-                switch (content_start[i]) {
-                    case 'n': content[ci++] = '\n'; break;
-                    case 't': content[ci++] = '\t'; break;
-                    case '"': content[ci++] = '"'; break;
-                    case '\\': content[ci++] = '\\'; break;
-                    default: content[ci++] = content_start[i]; break;
-                }
-            } else {
-                content[ci++] = content_start[i];
-            }
+        @autoreleasepool {
+            NSData *data = [NSData dataWithBytes:line length:strlen(line)];
+            NSError *error = nil;
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+            if (![obj isKindOfClass:[NSDictionary class]]) continue;
+            NSDictionary *msg = (NSDictionary *)obj;
+            NSString *role = msg[@"role"];
+            NSString *content = msg[@"content"];
+            if (![role isKindOfClass:[NSString class]] || ![content isKindOfClass:[NSString class]]) continue;
+            [messages addObject:@{@"role": role, @"content": content}];
         }
-        content[ci] = 0;
+    }
+    fclose(f);
+    return messages;
+}
 
-        if (strcmp(role, "user") == 0) {
-            printf("\033[1m> %s\033[0m\n\n", content);
-        } else if (strcmp(role, "assistant") == 0) {
-            printf("%s\n\n", content);
+static int session_load(const char *session_id, NSArray *messages) {
+    if (!messages) return 0;
+    printf("[resuming session %s]\n\n", session_id);
+    int turns = 0;
+    for (NSDictionary *msg in messages) {
+        NSString *role = msg[@"role"];
+        NSString *content = msg[@"content"];
+        if ([role isEqualToString:@"user"]) {
+            printf("\033[1m> %s\033[0m\n\n", content.UTF8String);
+        } else if ([role isEqualToString:@"assistant"]) {
+            printf("%s\n\n", content.UTF8String);
         }
         turns++;
     }
-    fclose(f);
     if (turns > 0) printf("[%d turns loaded]\n\n", turns);
     return turns;
+}
+
+static char *session_load_server_id(const char *session_id) {
+    char path[1024];
+    session_meta_path(session_id, path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    char buf[256];
+    if (!fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) buf[--len] = 0;
+    return len > 0 ? strdup(buf) : NULL;
+}
+
+static void session_save_server_id(const char *session_id, const char *server_id) {
+    if (!session_id || !session_id[0] || !server_id || !server_id[0]) return;
+    char path[1024];
+    session_meta_path(session_id, path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", server_id);
+    fclose(f);
 }
 
 // List recent sessions
@@ -184,7 +204,7 @@ static void generate_session_id(char *buf, size_t bufsize) {
              (int)getpid(), (long)tv.tv_sec, (int)tv.tv_usec);
 }
 
-static int send_chat_request(int port, const char *user_message, int max_tokens, const char *session_id) {
+static int send_http_request(int port, const char *request, size_t req_len) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
 
@@ -198,29 +218,78 @@ static int send_chat_request(int port, const char *user_message, int max_tokens,
         close(sock);
         return -1;
     }
-
-    char escaped[MAX_INPUT_LINE * 2];
-    json_escape(user_message, escaped, sizeof(escaped));
-
-    char body[MAX_INPUT_LINE * 3];
-    int body_len = snprintf(body, sizeof(body),
-        "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
-        "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\"}",
-        escaped, max_tokens, session_id);
-
-    char request[MAX_INPUT_LINE * 4];
-    int req_len = snprintf(request, sizeof(request),
-        "POST /v1/chat/completions HTTP/1.1\r\n"
-        "Host: localhost:%d\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "%s",
-        port, body_len, body);
-
     write(sock, request, req_len);
     return sock;
+}
+
+static int send_chat_request_messages(int port, NSArray *messages, int max_tokens, const char *session_id) {
+    if (!messages) return -1;
+    NSError *error = nil;
+    NSMutableDictionary *body = [@{
+        @"messages": messages,
+        @"max_tokens": @(max_tokens),
+        @"stream": @YES,
+    } mutableCopy];
+    if (session_id && session_id[0]) {
+        body[@"session_id"] = [NSString stringWithUTF8String:session_id];
+    }
+    NSData *body_data = [NSJSONSerialization dataWithJSONObject:body options:0 error:&error];
+    if (!body_data) {
+        fprintf(stderr, "\n[error] Failed to encode request JSON.\n");
+        return -1;
+    }
+
+    NSMutableData *request = [NSMutableData data];
+    NSString *header = [NSString stringWithFormat:
+        @"POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: localhost:%d\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %lu\r\n"
+        "Connection: close\r\n"
+        "\r\n", port, (unsigned long)body_data.length];
+    [request appendData:[header dataUsingEncoding:NSUTF8StringEncoding]];
+    [request appendData:body_data];
+    return send_http_request(port, request.bytes, request.length);
+}
+
+__attribute__((unused))
+static int send_chat_request(int port, const char *user_message, int max_tokens, const char *session_id) {
+    NSString *content = [NSString stringWithUTF8String:user_message ?: ""];
+    NSArray *messages = @[@{@"role": @"user", @"content": content ?: @""}];
+    return send_chat_request_messages(port, messages, max_tokens, session_id);
+}
+
+static char *fetch_server_instance_id(int port) {
+    char request[256];
+    int req_len = snprintf(request, sizeof(request),
+                           "GET /health HTTP/1.1\r\n"
+                           "Host: localhost:%d\r\n"
+                           "Connection: close\r\n"
+                           "\r\n", port);
+    int sock = send_http_request(port, request, (size_t)req_len);
+    if (sock < 0) return NULL;
+
+    char buffer[8192];
+    ssize_t total = 0;
+    while (total < (ssize_t)sizeof(buffer) - 1) {
+        ssize_t n = read(sock, buffer + total, sizeof(buffer) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += n;
+    }
+    close(sock);
+    buffer[total] = 0;
+
+    char *body = strstr(buffer, "\r\n\r\n");
+    if (!body) return NULL;
+    body += 4;
+
+    NSData *data = [NSData dataWithBytes:body length:strlen(body)];
+    NSError *error = nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    if (![obj isKindOfClass:[NSDictionary class]]) return NULL;
+    NSString *server_id = ((NSDictionary *)obj)[@"server_instance_id"];
+    if (![server_id isKindOfClass:[NSString class]] || server_id.length == 0) return NULL;
+    return strdup(server_id.UTF8String);
 }
 
 // ============================================================================
@@ -249,7 +318,7 @@ typedef struct {
     int pending_len;
 } MdState;
 
-static MdState g_md = {0, 0, 0, 0, 1, {0}, 0};
+static MdState g_md = {.line_start = 1};
 
 static void md_reset(void) {
     memset(&g_md, 0, sizeof(g_md));
@@ -417,8 +486,8 @@ static char *stream_response(int sock, int show_thinking) {
     FILE *stream = fdopen(sock, "r");
     if (!stream) { close(sock); return NULL; }
 
-    int header_done = 0, in_think = 0, tokens = 0;
-    double t_start = now_ms(), t_first = 0;
+    int header_done = 0, in_think = 0, tokens = 0, announced_hidden_think = 0;
+    double t_first = 0;
     md_reset();  // fresh markdown state for each response
 
     char *response = calloc(1, MAX_RESPONSE);
@@ -453,7 +522,14 @@ static char *stream_response(int sock, int show_thinking) {
         decoded[di] = 0;
         if (!di) continue;
 
-        if (strstr(decoded, "<think>")) in_think = 1;
+        if (strstr(decoded, "<think>")) {
+            in_think = 1;
+            if (!show_thinking && !announced_hidden_think) {
+                printf(ANSI_DIM "[thinking hidden; run with --show-think to display it]" ANSI_RESET "\n");
+                fflush(stdout);
+                announced_hidden_think = 1;
+            }
+        }
         if (strstr(decoded, "</think>")) { in_think = 0; tokens++; continue; }
         tokens++;
         if (!t_first) t_first = now_ms();
@@ -543,29 +619,30 @@ int main(int argc, char **argv) {
     printf("\n  Commands: /quit /exit /clear /sessions\n");
     printf("==================================================\n\n");
 
-    // Health check
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    char *server_instance_id = fetch_server_instance_id(port);
+    if (!server_instance_id) {
         fprintf(stderr, "Server not running on port %d.\n", port);
         fprintf(stderr, "Start it: ./infer --serve %d\n\n", port);
-        close(sock);
         return 1;
     }
-    close(sock);
+
+    NSMutableArray *history_messages = [NSMutableArray array];
+    int replay_history_on_next_send = 0;
 
     // Resume: load and display previous conversation
     if (resume_id) {
-        int turns = session_load(session_id);
+        NSArray *loaded_messages = session_load_messages(session_id);
+        if (loaded_messages) [history_messages addObjectsFromArray:loaded_messages];
+        int turns = session_load(session_id, history_messages);
         if (turns == 0) {
             printf("No session found with ID: %s\n\n", session_id);
         }
-        // Note: server-side KV cache may not match if server restarted.
-        // The conversation will continue but model won't "remember" old context
-        // unless we re-prefill (TODO: detect server restart and replay).
+        char *saved_server_id = session_load_server_id(session_id);
+        if (!saved_server_id || strcmp(saved_server_id, server_instance_id) != 0) {
+            replay_history_on_next_send = 1;
+            printf("[server changed; next turn will replay saved history]\n\n");
+        }
+        free(saved_server_id);
     }
 
     printf("Ready to chat.\n\n");
@@ -602,6 +679,8 @@ int main(int argc, char **argv) {
         }
         if (strcmp(input_line, "/clear") == 0) {
             generate_session_id(session_id, sizeof(session_id));
+            [history_messages removeAllObjects];
+            replay_history_on_next_send = 0;
             printf("[new session: %s]\n\n", session_id);
             continue;
         }
@@ -612,8 +691,20 @@ int main(int argc, char **argv) {
 
         // Save user turn
         session_save_turn(session_id, "user", input_line);
+        NSDictionary *user_message = @{
+            @"role": @"user",
+            @"content": [NSString stringWithUTF8String:input_line] ?: @""
+        };
+        NSArray *request_messages = nil;
+        if (replay_history_on_next_send && history_messages.count > 0) {
+            NSMutableArray *full_messages = [history_messages mutableCopy];
+            [full_messages addObject:user_message];
+            request_messages = full_messages;
+        } else {
+            request_messages = @[user_message];
+        }
 
-        sock = send_chat_request(port, input_line, max_tokens, session_id);
+        int sock = send_chat_request_messages(port, request_messages, max_tokens, session_id);
         if (sock < 0) continue;
 
         printf("\n");
@@ -622,6 +713,13 @@ int main(int argc, char **argv) {
         // Save assistant turn
         if (response && strlen(response) > 0) {
             session_save_turn(session_id, "assistant", response);
+            [history_messages addObject:user_message];
+            [history_messages addObject:@{
+                @"role": @"assistant",
+                @"content": [NSString stringWithUTF8String:response] ?: @""
+            }];
+            replay_history_on_next_send = 0;
+            session_save_server_id(session_id, server_instance_id);
         }
 
         // ---- Tool call handling ----
@@ -741,7 +839,20 @@ int main(int argc, char **argv) {
             snprintf(tool_msg, out_len + 256, "<tool_response>\n%s</tool_response>", output);
 
             free(response);
-            sock = send_chat_request(port, tool_msg, max_tokens, session_id);
+            NSArray *tool_messages = nil;
+            NSDictionary *tool_message = @{
+                @"role": @"user",
+                @"content": [NSString stringWithUTF8String:tool_msg] ?: @""
+            };
+            if (replay_history_on_next_send && history_messages.count > 0) {
+                NSMutableArray *full_messages = [history_messages mutableCopy];
+                [full_messages addObject:tool_message];
+                tool_messages = full_messages;
+            } else {
+                tool_messages = @[tool_message];
+            }
+
+            sock = send_chat_request_messages(port, tool_messages, max_tokens, session_id);
             free(tool_msg);
             if (sock < 0) { response = NULL; break; }
 
@@ -750,11 +861,19 @@ int main(int argc, char **argv) {
 
             if (response && strlen(response) > 0) {
                 session_save_turn(session_id, "assistant", response);
+                [history_messages addObject:tool_message];
+                [history_messages addObject:@{
+                    @"role": @"assistant",
+                    @"content": [NSString stringWithUTF8String:response] ?: @""
+                }];
+                replay_history_on_next_send = 0;
+                session_save_server_id(session_id, server_instance_id);
             }
         }
 
         free(response);
     }
 
+    free(server_instance_id);
     return 0;
 }

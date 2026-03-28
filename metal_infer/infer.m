@@ -78,11 +78,13 @@
 #define RMS_NORM_EPS        1e-6f
 #define NUM_EXPERTS         512
 #define NUM_EXPERTS_PER_TOK 10
+#define MAX_K              10
 #define MOE_INTERMEDIATE    1024
 #define SHARED_INTERMEDIATE 1024
 #define FULL_ATTN_INTERVAL  4
 #define GROUP_SIZE          64
 #define BITS                4
+#define MAX_ACTIVE_SESSIONS 4
 
 // Linear attention (GatedDeltaNet) constants
 #define LINEAR_NUM_V_HEADS  64
@@ -124,7 +126,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT ""
 
 // ============================================================================
 // Timing helper
@@ -183,7 +185,7 @@ typedef struct {
 } LZ4IndexEntry;
 
 static LZ4IndexEntry *g_lz4_index[NUM_LAYERS];  // per-layer index (NULL if not using LZ4)
-static void *g_lz4_comp_bufs[8];                 // pre-allocated compressed read buffers (MAX_K=8)
+static void *g_lz4_comp_bufs[MAX_K];             // pre-allocated compressed read buffers
 static int g_use_lz4 = 0;                        // auto-detected from packed_experts_lz4/
 
 // ============================================================================
@@ -195,6 +197,55 @@ static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static int g_debug_logits = 0;    // enabled by --debug-logits
+
+typedef enum {
+    PROFILE_CUSTOM = 0,
+    PROFILE_SPEED,
+    PROFILE_BALANCED,
+    PROFILE_QUALITY,
+} RuntimeProfile;
+
+typedef enum {
+    KV_QUANT_OFF = 0,
+    KV_QUANT_BASELINE,
+    KV_QUANT_TURBO_K,
+} KVQuantMode;
+
+typedef struct {
+    int version;
+    int loaded;
+    char strategy[64];
+    char model_revision[128];
+    uint16_t logical_to_physical[NUM_LAYERS][NUM_EXPERTS];
+} ExpertLayoutManifest;
+
+static RuntimeProfile g_runtime_profile = PROFILE_CUSTOM;
+static KVQuantMode g_kv_quant_mode = KV_QUANT_OFF;
+static int g_kv_hot_window = 4096;
+static int g_kv_block_size = 256;
+static const char *g_metrics_json_path = NULL;
+static const char *g_layout_manifest_path = NULL;
+static ExpertLayoutManifest g_layout_manifest = {0};
+
+static inline int map_expert_to_physical(int layer_idx, int logical_expert);
+
+static const char *runtime_profile_name(RuntimeProfile profile) {
+    switch (profile) {
+        case PROFILE_SPEED: return "speed";
+        case PROFILE_BALANCED: return "balanced";
+        case PROFILE_QUALITY: return "quality";
+        default: return "custom";
+    }
+}
+
+static const char *kv_quant_mode_name(KVQuantMode mode) {
+    switch (mode) {
+        case KV_QUANT_BASELINE: return "baseline";
+        case KV_QUANT_TURBO_K: return "turbo-k";
+        default: return "off";
+    }
+}
 
 // Tiered I/O: cold fds (F_NOCACHE) for first reads, warm fds (page cached) for repeats
 static int *g_layer_fds_cold = NULL;    // [NUM_LAYERS] cold fds (set in main)
@@ -219,6 +270,9 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
 // Active expert size based on quantization mode
 static inline size_t active_expert_size(void) {
     return g_use_2bit ? EXPERT_SIZE_2BIT : EXPERT_SIZE;
+}
+static inline off_t expert_file_offset(int layer_idx, int logical_expert) {
+    return (off_t)map_expert_to_physical(layer_idx, logical_expert) * (off_t)active_expert_size();
 }
 static int g_freq_total_tokens = 0;  // total tokens processed while tracking
 
@@ -461,6 +515,110 @@ static TensorManifest *load_manifest(const char *json_path) {
     }
 }
 
+static void expert_layout_manifest_init_identity(ExpertLayoutManifest *manifest) {
+    if (!manifest) return;
+    memset(manifest, 0, sizeof(*manifest));
+    manifest->version = 1;
+    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        for (int expert = 0; expert < NUM_EXPERTS; expert++) {
+            manifest->logical_to_physical[layer][expert] = (uint16_t)expert;
+        }
+    }
+}
+
+static int load_expert_layout_manifest(const char *json_path, ExpertLayoutManifest *out_manifest) {
+    if (!json_path || !json_path[0] || !out_manifest) return 0;
+    expert_layout_manifest_init_identity(out_manifest);
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:json_path]];
+        if (!data) {
+            fprintf(stderr, "ERROR: Cannot read layout manifest %s\n", json_path);
+            return 0;
+        }
+        NSError *error = nil;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+        if (![root isKindOfClass:[NSDictionary class]]) {
+            fprintf(stderr, "ERROR: Layout manifest parse failed: %s\n",
+                    error ? [[error localizedDescription] UTF8String] : "invalid JSON");
+            return 0;
+        }
+        NSNumber *version = root[@"version"];
+        out_manifest->version = [version isKindOfClass:[NSNumber class]] ? version.intValue : 1;
+        NSString *strategy = root[@"layout_strategy"];
+        if ([strategy isKindOfClass:[NSString class]]) {
+            snprintf(out_manifest->strategy, sizeof(out_manifest->strategy), "%s", strategy.UTF8String);
+        }
+        NSString *revision = root[@"model_revision"];
+        if ([revision isKindOfClass:[NSString class]]) {
+            snprintf(out_manifest->model_revision, sizeof(out_manifest->model_revision), "%s", revision.UTF8String);
+        }
+        NSArray *layers = root[@"layers"];
+        if (![layers isKindOfClass:[NSArray class]] || (int)[layers count] != NUM_LAYERS) {
+            fprintf(stderr, "ERROR: Layout manifest must contain %d layers\n", NUM_LAYERS);
+            return 0;
+        }
+        for (NSDictionary *entry in layers) {
+            if (![entry isKindOfClass:[NSDictionary class]]) {
+                fprintf(stderr, "ERROR: Layout manifest layer entry must be an object\n");
+                return 0;
+            }
+            NSNumber *layer_num = entry[@"layer"];
+            NSArray *mapping = entry[@"logical_to_physical"];
+            if (![layer_num isKindOfClass:[NSNumber class]] ||
+                ![mapping isKindOfClass:[NSArray class]]) {
+                fprintf(stderr, "ERROR: Layout manifest layer entry missing fields\n");
+                return 0;
+            }
+            int layer = layer_num.intValue;
+            if (layer < 0 || layer >= NUM_LAYERS || (int)[mapping count] != NUM_EXPERTS) {
+                fprintf(stderr, "ERROR: Layout manifest layer %d has invalid mapping size\n", layer);
+                return 0;
+            }
+            uint8_t seen[NUM_EXPERTS] = {0};
+            for (int logical = 0; logical < NUM_EXPERTS; logical++) {
+                NSNumber *mapped = mapping[logical];
+                if (![mapped isKindOfClass:[NSNumber class]]) {
+                    fprintf(stderr, "ERROR: Layout manifest layer %d mapping entry %d is invalid\n", layer, logical);
+                    return 0;
+                }
+                int physical = mapped.intValue;
+                if (physical < 0 || physical >= NUM_EXPERTS || seen[physical]) {
+                    fprintf(stderr, "ERROR: Layout manifest layer %d has invalid physical expert %d\n",
+                            layer, physical);
+                    return 0;
+                }
+                seen[physical] = 1;
+                out_manifest->logical_to_physical[layer][logical] = (uint16_t)physical;
+            }
+        }
+        out_manifest->loaded = 1;
+    }
+    return 1;
+}
+
+static inline int map_expert_to_physical(int layer_idx, int logical_expert) {
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS ||
+        logical_expert < 0 || logical_expert >= NUM_EXPERTS) {
+        return logical_expert;
+    }
+    return g_layout_manifest.logical_to_physical[layer_idx][logical_expert];
+}
+
+static RuntimeProfile parse_runtime_profile(const char *value) {
+    if (!value) return PROFILE_CUSTOM;
+    if (strcmp(value, "speed") == 0) return PROFILE_SPEED;
+    if (strcmp(value, "balanced") == 0) return PROFILE_BALANCED;
+    if (strcmp(value, "quality") == 0) return PROFILE_QUALITY;
+    return PROFILE_CUSTOM;
+}
+
+static KVQuantMode parse_kv_quant_mode(const char *value) {
+    if (!value) return KV_QUANT_OFF;
+    if (strcmp(value, "baseline") == 0) return KV_QUANT_BASELINE;
+    if (strcmp(value, "turbo-k") == 0) return KV_QUANT_TURBO_K;
+    return KV_QUANT_OFF;
+}
+
 // Hash table for O(1) tensor lookup (replaces O(N) linear scan).
 // FNV-1a hash, open addressing with linear probing.
 #define TENSOR_HT_SIZE 8192  // power of 2, > 4x num_tensors (2092)
@@ -610,12 +768,7 @@ static Vocabulary *load_vocab(const char *path) {
     return v;
 }
 
-static const char *decode_token(Vocabulary *v, int token_id) {
-    if (token_id < 0 || token_id >= v->num_tokens || !v->tokens[token_id]) {
-        return "<unk>";
-    }
-    return v->tokens[token_id];
-}
+static const char *decode_token(Vocabulary *v, int token_id);
 
 // ============================================================================
 // Prompt tokens loader
@@ -690,6 +843,183 @@ static PromptTokens *encode_prompt_text_to_tokens(const char *text) {
     fprintf(stderr, "]\n");
 
     return pt;
+}
+
+typedef struct {
+    unsigned char pending[8];
+    int pending_len;
+} TokenStreamDecoder;
+
+static int utf8_next_codepoint(const unsigned char *s, int len, uint32_t *cp, int *consumed) {
+    if (len <= 0) return -1;
+    unsigned char b0 = s[0];
+    if (b0 < 0x80) {
+        *cp = b0;
+        *consumed = 1;
+        return 0;
+    }
+    if ((b0 & 0xE0) == 0xC0) {
+        if (len < 2 || (s[1] & 0xC0) != 0x80) return -1;
+        *cp = ((uint32_t)(b0 & 0x1F) << 6) | (uint32_t)(s[1] & 0x3F);
+        *consumed = 2;
+        return 0;
+    }
+    if ((b0 & 0xF0) == 0xE0) {
+        if (len < 3 || (s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return -1;
+        *cp = ((uint32_t)(b0 & 0x0F) << 12) |
+              ((uint32_t)(s[1] & 0x3F) << 6) |
+              (uint32_t)(s[2] & 0x3F);
+        *consumed = 3;
+        return 0;
+    }
+    if ((b0 & 0xF8) == 0xF0) {
+        if (len < 4 || (s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80 || (s[3] & 0xC0) != 0x80) return -1;
+        *cp = ((uint32_t)(b0 & 0x07) << 18) |
+              ((uint32_t)(s[1] & 0x3F) << 12) |
+              ((uint32_t)(s[2] & 0x3F) << 6) |
+              (uint32_t)(s[3] & 0x3F);
+        *consumed = 4;
+        return 0;
+    }
+    return -1;
+}
+
+static int utf8_valid_prefix_len(const unsigned char *buf, int len) {
+    int i = 0;
+    int last_complete = 0;
+
+    while (i < len) {
+        unsigned char b0 = buf[i];
+        if (b0 < 0x80) {
+            i++;
+            last_complete = i;
+            continue;
+        }
+
+        int need = 0;
+        if ((b0 & 0xE0) == 0xC0) need = 2;
+        else if ((b0 & 0xF0) == 0xE0) need = 3;
+        else if ((b0 & 0xF8) == 0xF0) need = 4;
+        else {
+            i++;
+            last_complete = i;
+            continue;
+        }
+
+        if (i + need > len) break;
+
+        int valid = 1;
+        for (int j = 1; j < need; j++) {
+            if ((buf[i + j] & 0xC0) != 0x80) {
+                valid = 0;
+                break;
+            }
+        }
+        if (!valid) {
+            i++;
+            last_complete = i;
+            continue;
+        }
+
+        i += need;
+        last_complete = i;
+    }
+
+    return last_complete;
+}
+
+static int decode_token_bytes(Vocabulary *v, int token_id, unsigned char *out, int out_cap) {
+    if (out_cap <= 0) return 0;
+    if (token_id < 0 || token_id >= v->num_tokens || !v->tokens[token_id]) {
+        const char *unk = "<unk>";
+        int n = (int)strlen(unk);
+        if (n > out_cap) n = out_cap;
+        memcpy(out, unk, n);
+        return n;
+    }
+
+    const unsigned char *src = (const unsigned char *)v->tokens[token_id];
+    int src_len = v->lengths[token_id];
+
+    if (!g_tokenizer_loaded) {
+        int n = src_len;
+        if (n > out_cap) n = out_cap;
+        memcpy(out, src, n);
+        return n;
+    }
+
+    int in_pos = 0;
+    int out_pos = 0;
+    while (in_pos < src_len && out_pos < out_cap) {
+        uint32_t cp = 0;
+        int consumed = 0;
+        if (utf8_next_codepoint(src + in_pos, src_len - in_pos, &cp, &consumed) == 0 && cp < 512) {
+            out[out_pos++] = g_tokenizer.char_byte[cp];
+            in_pos += consumed;
+            continue;
+        }
+
+        int copy_len = consumed > 0 ? consumed : 1;
+        if (out_pos + copy_len > out_cap) copy_len = out_cap - out_pos;
+        memcpy(out + out_pos, src + in_pos, copy_len);
+        out_pos += copy_len;
+        in_pos += consumed > 0 ? consumed : 1;
+    }
+    return out_pos;
+}
+
+static void token_stream_decoder_reset(TokenStreamDecoder *dec) {
+    dec->pending_len = 0;
+}
+
+static int token_stream_decode(Vocabulary *v, int token_id, TokenStreamDecoder *dec, char *out, int out_cap) {
+    if (out_cap <= 1) return 0;
+
+    unsigned char token_bytes[4096];
+    unsigned char merged[4096 + 8];
+    int token_len = decode_token_bytes(v, token_id, token_bytes, sizeof(token_bytes));
+    if (token_len < 0) token_len = 0;
+
+    int total = 0;
+    if (dec->pending_len > 0) {
+        memcpy(merged, dec->pending, dec->pending_len);
+        total += dec->pending_len;
+    }
+    if (token_len > 0) {
+        if (total + token_len > (int)sizeof(merged)) token_len = (int)sizeof(merged) - total;
+        memcpy(merged + total, token_bytes, token_len);
+        total += token_len;
+    }
+
+    int prefix_len = utf8_valid_prefix_len(merged, total);
+    int emit_len = prefix_len;
+    if (emit_len > out_cap - 1) emit_len = out_cap - 1;
+    if (emit_len > 0) memcpy(out, merged, emit_len);
+    out[emit_len] = '\0';
+
+    dec->pending_len = total - prefix_len;
+    if (dec->pending_len > 0) {
+        memcpy(dec->pending, merged + prefix_len, dec->pending_len);
+    }
+    return emit_len;
+}
+
+static int token_stream_flush(TokenStreamDecoder *dec, char *out, int out_cap) {
+    if (out_cap <= 1) return 0;
+    int n = dec->pending_len;
+    if (n > out_cap - 1) n = out_cap - 1;
+    if (n > 0) memcpy(out, dec->pending, n);
+    out[n] = '\0';
+    dec->pending_len = 0;
+    return n;
+}
+
+static const char *decode_token(Vocabulary *v, int token_id) {
+    static char buf[4096];
+    int n = decode_token_bytes(v, token_id, (unsigned char *)buf, sizeof(buf) - 1);
+    if (n < 0) n = 0;
+    buf[n] = '\0';
+    return buf;
 }
 
 // ============================================================================
@@ -852,6 +1182,141 @@ static int cpu_argmax(const float *x, int dim) {
     return best;
 }
 
+typedef struct {
+    float temperature;
+    float top_p;
+    int top_k;
+    float presence_penalty;
+    float frequency_penalty;
+    float repetition_penalty;
+    uint64_t rng_state;
+} SamplerConfig;
+
+static int *g_sample_ids = NULL;
+static float *g_sample_vals = NULL;
+static float *g_sample_probs = NULL;
+static int g_sample_cap = 0;
+
+static void ensure_sampler_scratch(int candidate_k) {
+    if (candidate_k <= g_sample_cap) return;
+    g_sample_ids = realloc(g_sample_ids, (size_t)candidate_k * sizeof(int));
+    g_sample_vals = realloc(g_sample_vals, (size_t)candidate_k * sizeof(float));
+    g_sample_probs = realloc(g_sample_probs, (size_t)candidate_k * sizeof(float));
+    g_sample_cap = candidate_k;
+}
+
+static uint64_t sampler_next_u64(uint64_t *state) {
+    uint64_t x = *state ? *state : 0x9E3779B97F4A7C15ULL;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 2685821657736338717ULL;
+}
+
+static float sampler_next_uniform(uint64_t *state) {
+    return (float)((sampler_next_u64(state) >> 11) * (1.0 / 9007199254740992.0));
+}
+
+static float apply_sampling_penalties(float logit, uint32_t count, const SamplerConfig *cfg) {
+    if (count == 0) return logit;
+    logit -= cfg->presence_penalty;
+    logit -= cfg->frequency_penalty * (float)count;
+    if (cfg->repetition_penalty > 1.0f) {
+        if (logit >= 0.0f) logit /= cfg->repetition_penalty;
+        else logit *= cfg->repetition_penalty;
+    }
+    return logit;
+}
+
+static int sample_next_token(const float *logits, int dim, SamplerConfig *cfg, const uint32_t *token_counts) {
+    if (!cfg || cfg->temperature <= 0.0f) {
+        return cpu_argmax(logits, dim);
+    }
+
+    int candidate_k = cfg->top_k > 0 ? cfg->top_k : 256;
+    if (candidate_k > dim) candidate_k = dim;
+    if (candidate_k <= 0) candidate_k = dim < 256 ? dim : 256;
+    ensure_sampler_scratch(candidate_k);
+
+    for (int k = 0; k < candidate_k; k++) {
+        g_sample_ids[k] = 0;
+        g_sample_vals[k] = -1e30f;
+    }
+
+    for (int i = 0; i < dim; i++) {
+        float val = logits[i];
+        if (token_counts) {
+            val = apply_sampling_penalties(val, token_counts[i], cfg);
+        }
+        int min_k = 0;
+        for (int k = 1; k < candidate_k; k++) {
+            if (g_sample_vals[k] < g_sample_vals[min_k]) min_k = k;
+        }
+        if (val > g_sample_vals[min_k]) {
+            g_sample_vals[min_k] = val;
+            g_sample_ids[min_k] = i;
+        }
+    }
+
+    for (int i = 0; i < candidate_k - 1; i++) {
+        int best = i;
+        for (int j = i + 1; j < candidate_k; j++) {
+            if (g_sample_vals[j] > g_sample_vals[best]) best = j;
+        }
+        if (best != i) {
+            float tmp_v = g_sample_vals[i];
+            int tmp_id = g_sample_ids[i];
+            g_sample_vals[i] = g_sample_vals[best];
+            g_sample_ids[i] = g_sample_ids[best];
+            g_sample_vals[best] = tmp_v;
+            g_sample_ids[best] = tmp_id;
+        }
+    }
+
+    float max_val = g_sample_vals[0] / cfg->temperature;
+    float sum = 0.0f;
+    for (int i = 0; i < candidate_k; i++) {
+        float p = expf((g_sample_vals[i] / cfg->temperature) - max_val);
+        g_sample_probs[i] = p;
+        sum += p;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        return g_sample_ids[0];
+    }
+    for (int i = 0; i < candidate_k; i++) {
+        g_sample_probs[i] /= sum;
+    }
+
+    int cutoff = candidate_k;
+    if (cfg->top_p > 0.0f && cfg->top_p < 1.0f) {
+        float cumulative = 0.0f;
+        cutoff = 0;
+        while (cutoff < candidate_k) {
+            cumulative += g_sample_probs[cutoff];
+            cutoff++;
+            if (cumulative >= cfg->top_p) break;
+        }
+        if (cutoff <= 0) cutoff = 1;
+        float renorm = 0.0f;
+        for (int i = 0; i < cutoff; i++) renorm += g_sample_probs[i];
+        if (renorm > 0.0f) {
+            float inv = 1.0f / renorm;
+            for (int i = 0; i < cutoff; i++) g_sample_probs[i] *= inv;
+        }
+    }
+
+    float r = sampler_next_uniform(&cfg->rng_state);
+    float cumulative = 0.0f;
+    for (int i = 0; i < cutoff; i++) {
+        cumulative += g_sample_probs[i];
+        if (r <= cumulative || i == cutoff - 1) {
+            return g_sample_ids[i];
+        }
+    }
+    return g_sample_ids[0];
+}
+
 // SiLU activation
 static void cpu_silu(float *x, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -934,7 +1399,6 @@ typedef struct {
     // Each expert k uses slot [k].
     // Double-buffered: set A (data) for GPU compute, set B (data_B) for background pread.
     // Gate/up/act/out only need one set (GPU uses them after pread completes).
-    #define MAX_K 8
     id<MTLBuffer> buf_multi_expert_data[MAX_K];   // [EXPERT_SIZE bytes] each — buffer set A
     id<MTLBuffer> buf_multi_expert_data_B[MAX_K]; // [EXPERT_SIZE bytes] each — buffer set B (prefetch)
     id<MTLBuffer> buf_multi_expert_gate[MAX_K];   // [MOE_INTERMEDIATE floats]
@@ -963,7 +1427,7 @@ typedef struct {
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
     id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
     id<MTLBuffer> buf_moe_hidden;     // [HIDDEN_DIM floats] GPU combine output (hidden state)
-    id<MTLBuffer> buf_combine_params; // [10 floats] expert weights[8] + shared_gate_score + padding
+    id<MTLBuffer> buf_combine_params; // [12 floats] expert weights[10] + shared_gate_score + padding
     id<MTLBuffer> buf_cmd3_sum_sq;    // [1 float] for RMS norm reduction in CMD3
     // Shared event for CPU-GPU synchronization (async pipeline)
     id<MTLSharedEvent> pipeline_event;   // CPU signals when buf_input is ready
@@ -1162,8 +1626,8 @@ static MetalCtx *metal_setup(void) {
     // CMD3 GPU-side combine buffers
     ctx->buf_moe_hidden    = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
-    ctx->buf_combine_params = [ctx->device newBufferWithLength:10 * sizeof(float)
-                                                        options:MTLResourceStorageModeShared];
+    ctx->buf_combine_params = [ctx->device newBufferWithLength:(MAX_K + 2) * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
     ctx->buf_cmd3_sum_sq    = [ctx->device newBufferWithLength:sizeof(float)
                                                         options:MTLResourceStorageModeShared];
 
@@ -2063,25 +2527,335 @@ static void apply_rotary_emb(float *q, float *k, int pos, int num_heads, int num
 // ============================================================================
 
 typedef struct {
-    float *k_cache;  // [max_seq, num_kv_heads * head_dim]
-    float *v_cache;  // [max_seq, num_kv_heads * head_dim]
-    int len;         // current number of cached entries
+    int start_pos;
+    int count;
+    int8_t *k_q;     // [count, kv_dim]
+    int8_t *v_q;     // [count, kv_dim]
+    float *k_scales; // [count, kv_dim/GROUP_SIZE]
+    float *v_scales; // [count, kv_dim/GROUP_SIZE]
+} KVColdBlock;
+
+typedef struct {
+    float *k_hot;     // [hot_capacity, kv_dim]
+    float *v_hot;     // [hot_capacity, kv_dim]
+    int hot_capacity;
+    int hot_start;
+    int hot_len;
+    int len;
+    KVColdBlock *blocks;
+    int num_blocks;
+    int cap_blocks;
 } KVCache;
+
+static inline int kv_dim_total(void) {
+    return NUM_KV_HEADS * HEAD_DIM;
+}
+
+static inline int kv_quant_enabled(void) {
+    return g_kv_quant_mode != KV_QUANT_OFF;
+}
+
+static inline int kv_groups_total(void) {
+    return kv_dim_total() / GROUP_SIZE;
+}
+
+static void kv_cold_block_free(KVColdBlock *block) {
+    if (!block) return;
+    free(block->k_q);
+    free(block->v_q);
+    free(block->k_scales);
+    free(block->v_scales);
+    memset(block, 0, sizeof(*block));
+}
+
+static void kv_cache_reset(KVCache *c) {
+    if (!c) return;
+    for (int i = 0; i < c->num_blocks; i++) kv_cold_block_free(&c->blocks[i]);
+    c->num_blocks = 0;
+    c->hot_start = 0;
+    c->hot_len = 0;
+    c->len = 0;
+}
+
+static void kv_quantize_tensor_block(
+    const float *src,
+    int count,
+    int kv_dim,
+    int8_t **out_q,
+    float **out_scales
+) {
+    int groups = kv_dim / GROUP_SIZE;
+    int8_t *q = malloc((size_t)count * kv_dim * sizeof(int8_t));
+    float *scales = malloc((size_t)count * groups * sizeof(float));
+    for (int t = 0; t < count; t++) {
+        const float *row = src + (size_t)t * kv_dim;
+        int8_t *row_q = q + (size_t)t * kv_dim;
+        float *row_scales = scales + (size_t)t * groups;
+        for (int g = 0; g < groups; g++) {
+            const float *group = row + g * GROUP_SIZE;
+            float max_abs = 0.0f;
+            for (int i = 0; i < GROUP_SIZE; i++) {
+                float a = fabsf(group[i]);
+                if (a > max_abs) max_abs = a;
+            }
+            float scale = max_abs > 1e-8f ? max_abs / 127.0f : (1.0f / 127.0f);
+            row_scales[g] = scale;
+            float inv = 1.0f / scale;
+            for (int i = 0; i < GROUP_SIZE; i++) {
+                int qv = (int)lrintf(group[i] * inv);
+                if (qv > 127) qv = 127;
+                else if (qv < -127) qv = -127;
+                row_q[g * GROUP_SIZE + i] = (int8_t)qv;
+            }
+        }
+    }
+    *out_q = q;
+    *out_scales = scales;
+}
+
+static void kv_cache_append_block(KVCache *c, int start_pos, int count,
+                                  const float *k_src, const float *v_src) {
+    if (!c || count <= 0) return;
+    if (c->num_blocks == c->cap_blocks) {
+        int new_cap = c->cap_blocks > 0 ? c->cap_blocks * 2 : 8;
+        c->blocks = realloc(c->blocks, (size_t)new_cap * sizeof(KVColdBlock));
+        memset(c->blocks + c->cap_blocks, 0, (size_t)(new_cap - c->cap_blocks) * sizeof(KVColdBlock));
+        c->cap_blocks = new_cap;
+    }
+    KVColdBlock *block = &c->blocks[c->num_blocks++];
+    memset(block, 0, sizeof(*block));
+    block->start_pos = start_pos;
+    block->count = count;
+    kv_quantize_tensor_block(k_src, count, kv_dim_total(), &block->k_q, &block->k_scales);
+    kv_quantize_tensor_block(v_src, count, kv_dim_total(), &block->v_q, &block->v_scales);
+}
+
+static void kv_cache_flush_oldest_block(KVCache *c) {
+    if (!c || !kv_quant_enabled() || c->hot_len < g_kv_block_size) return;
+    int count = g_kv_block_size;
+    int kv_dim = kv_dim_total();
+    kv_cache_append_block(c, c->hot_start, count, c->k_hot, c->v_hot);
+    int remaining = c->hot_len - count;
+    if (remaining > 0) {
+        memmove(c->k_hot, c->k_hot + (size_t)count * kv_dim, (size_t)remaining * kv_dim * sizeof(float));
+        memmove(c->v_hot, c->v_hot + (size_t)count * kv_dim, (size_t)remaining * kv_dim * sizeof(float));
+    }
+    c->hot_start += count;
+    c->hot_len = remaining;
+}
 
 static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
-    c->v_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
-    c->len = 0;
+    c->hot_capacity = kv_quant_enabled() ? g_kv_hot_window : MAX_SEQ_LEN;
+    if (c->hot_capacity <= 0) c->hot_capacity = MAX_SEQ_LEN;
+    c->k_hot = calloc((size_t)c->hot_capacity * kv_dim_total(), sizeof(float));
+    c->v_hot = calloc((size_t)c->hot_capacity * kv_dim_total(), sizeof(float));
     return c;
 }
 
 static void kv_cache_free(KVCache *c) {
     if (c) {
-        free(c->k_cache);
-        free(c->v_cache);
+        kv_cache_reset(c);
+        free(c->blocks);
+        free(c->k_hot);
+        free(c->v_hot);
         free(c);
     }
+}
+
+static void kv_cache_append(KVCache *c, const float *k, const float *v) {
+    if (!c) return;
+    int kv_dim = kv_dim_total();
+    if (c->hot_len >= c->hot_capacity) {
+        if (kv_quant_enabled()) {
+            kv_cache_flush_oldest_block(c);
+        }
+        if (c->hot_len >= c->hot_capacity) {
+            fprintf(stderr, "ERROR: KV hot window overflow (capacity=%d, len=%d)\n",
+                    c->hot_capacity, c->hot_len);
+            abort();
+        }
+    }
+    memcpy(c->k_hot + (size_t)c->hot_len * kv_dim, k, (size_t)kv_dim * sizeof(float));
+    memcpy(c->v_hot + (size_t)c->hot_len * kv_dim, v, (size_t)kv_dim * sizeof(float));
+    c->hot_len++;
+    c->len++;
+    if (kv_quant_enabled() && c->hot_len > g_kv_hot_window) {
+        kv_cache_flush_oldest_block(c);
+    }
+}
+
+static int kv_cache_gpu_compatible(const KVCache *c) {
+    return c && c->num_blocks == 0 && c->hot_start == 0 && c->len == c->hot_len;
+}
+
+static float kv_quantized_dot_head(const int8_t *row_q, const float *row_scales,
+                                   const float *qh, int head_offset) {
+    float dot = 0.0f;
+    int start_group = head_offset / GROUP_SIZE;
+    int end_group = (head_offset + HEAD_DIM) / GROUP_SIZE;
+    for (int g = start_group; g < end_group; g++) {
+        float scale = row_scales[g];
+        int base = g * GROUP_SIZE;
+        for (int i = 0; i < GROUP_SIZE; i++) {
+            int d = base + i - head_offset;
+            if (d >= 0 && d < HEAD_DIM) {
+                dot += qh[d] * ((float)row_q[base + i] * scale);
+            }
+        }
+    }
+    return dot;
+}
+
+static void kv_quantized_accumulate_head(float *oh, const int8_t *row_q, const float *row_scales,
+                                         int head_offset, float weight) {
+    int start_group = head_offset / GROUP_SIZE;
+    int end_group = (head_offset + HEAD_DIM) / GROUP_SIZE;
+    for (int g = start_group; g < end_group; g++) {
+        float scale = row_scales[g];
+        int base = g * GROUP_SIZE;
+        for (int i = 0; i < GROUP_SIZE; i++) {
+            int d = base + i - head_offset;
+            if (d >= 0 && d < HEAD_DIM) {
+                oh[d] += weight * ((float)row_q[base + i] * scale);
+            }
+        }
+    }
+}
+
+static void kv_cache_copy_raw(const KVCache *c, float *dst_k, float *dst_v) {
+    if (!c || c->len == 0) return;
+    int kv_dim = kv_dim_total();
+    size_t out = 0;
+    int groups = kv_groups_total();
+    for (int b = 0; b < c->num_blocks; b++) {
+        const KVColdBlock *block = &c->blocks[b];
+        for (int t = 0; t < block->count; t++) {
+            float *dk = dst_k + out * kv_dim;
+            float *dv = dst_v + out * kv_dim;
+            const int8_t *kq = block->k_q + (size_t)t * kv_dim;
+            const int8_t *vq = block->v_q + (size_t)t * kv_dim;
+            const float *ks = block->k_scales + (size_t)t * groups;
+            const float *vs = block->v_scales + (size_t)t * groups;
+            for (int g = 0; g < groups; g++) {
+                float k_scale = ks[g];
+                float v_scale = vs[g];
+                int base = g * GROUP_SIZE;
+                for (int i = 0; i < GROUP_SIZE; i++) {
+                    dk[base + i] = (float)kq[base + i] * k_scale;
+                    dv[base + i] = (float)vq[base + i] * v_scale;
+                }
+            }
+            out++;
+        }
+    }
+    if (c->hot_len > 0) {
+        memcpy(dst_k + out * kv_dim, c->k_hot, (size_t)c->hot_len * kv_dim * sizeof(float));
+        memcpy(dst_v + out * kv_dim, c->v_hot, (size_t)c->hot_len * kv_dim * sizeof(float));
+    }
+}
+
+static void kv_cache_load_raw(KVCache *c, const float *src_k, const float *src_v, int len) {
+    if (!c) return;
+    kv_cache_reset(c);
+    int kv_dim = kv_dim_total();
+    for (int i = 0; i < len; i++) {
+        kv_cache_append(c, src_k + (size_t)i * kv_dim, src_v + (size_t)i * kv_dim);
+    }
+}
+
+static size_t kv_cache_live_bytes(const KVCache *c) {
+    if (!c) return 0;
+    size_t bytes = (size_t)c->hot_capacity * kv_dim_total() * sizeof(float) * 2;
+    for (int i = 0; i < c->num_blocks; i++) {
+        const KVColdBlock *block = &c->blocks[i];
+        bytes += (size_t)block->count * kv_dim_total() * sizeof(int8_t) * 2;
+        bytes += (size_t)block->count * kv_groups_total() * sizeof(float) * 2;
+    }
+    return bytes;
+}
+
+static size_t kv_cache_raw_bytes(const KVCache *c) {
+    if (!c) return 0;
+    return (size_t)c->len * kv_dim_total() * sizeof(float) * 2;
+}
+
+static void kv_cache_collect_stats(KVCache **kv_caches, size_t *raw_bytes, size_t *live_bytes,
+                                   int *cold_blocks, int *cold_tokens) {
+    size_t raw_total = 0;
+    size_t live_total = 0;
+    int block_total = 0;
+    int token_total = 0;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if (!kv_caches[i]) continue;
+        raw_total += kv_cache_raw_bytes(kv_caches[i]);
+        live_total += kv_cache_live_bytes(kv_caches[i]);
+        block_total += kv_caches[i]->num_blocks;
+        for (int b = 0; b < kv_caches[i]->num_blocks; b++) {
+            token_total += kv_caches[i]->blocks[b].count;
+        }
+    }
+    if (raw_bytes) *raw_bytes = raw_total;
+    if (live_bytes) *live_bytes = live_total;
+    if (cold_blocks) *cold_blocks = block_total;
+    if (cold_tokens) *cold_tokens = token_total;
+}
+
+static void write_metrics_json(const char *path,
+                               int K,
+                               int prompt_tokens,
+                               int generated_tokens,
+                               double ttft_ms,
+                               double total_time_ms,
+                               KVCache **kv_caches) {
+    if (!path || !path[0]) return;
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "WARNING: cannot open metrics file %s\n", path);
+        return;
+    }
+    size_t kv_raw = 0, kv_live = 0;
+    int cold_blocks = 0, cold_tokens = 0;
+    kv_cache_collect_stats(kv_caches, &kv_raw, &kv_live, &cold_blocks, &cold_tokens);
+    double gen_time_ms = generated_tokens > 1 ? (total_time_ms - ttft_ms) : 0.0;
+    double tok_s = (generated_tokens > 1 && gen_time_ms > 0.0)
+        ? ((generated_tokens - 1) * 1000.0 / gen_time_ms) : 0.0;
+    fprintf(f,
+            "{\n"
+            "  \"profile\": \"%s\",\n"
+            "  \"k\": %d,\n"
+            "  \"quant\": \"%s\",\n"
+            "  \"kv_quant\": \"%s\",\n"
+            "  \"kv_hot_window\": %d,\n"
+            "  \"kv_block_size\": %d,\n"
+            "  \"layout_manifest_version\": %d,\n"
+            "  \"prompt_tokens\": %d,\n"
+            "  \"generated_tokens\": %d,\n"
+            "  \"ttft_ms\": %.3f,\n"
+            "  \"total_time_ms\": %.3f,\n"
+            "  \"tok_per_s\": %.3f,\n"
+            "  \"kv_raw_bytes\": %zu,\n"
+            "  \"kv_live_bytes\": %zu,\n"
+            "  \"kv_cold_blocks\": %d,\n"
+            "  \"kv_cold_tokens\": %d\n"
+            "}\n",
+            runtime_profile_name(g_runtime_profile),
+            K,
+            g_use_2bit ? "2bit" : "4bit",
+            kv_quant_mode_name(g_kv_quant_mode),
+            g_kv_hot_window,
+            g_kv_block_size,
+            g_layout_manifest.version,
+            prompt_tokens,
+            generated_tokens,
+            ttft_ms,
+            total_time_ms,
+            tok_s,
+            kv_raw,
+            kv_live,
+            cold_blocks,
+            cold_tokens);
+    fclose(f);
 }
 
 // ============================================================================
@@ -2258,10 +3032,7 @@ static void full_attention_forward(
     apply_rotary_emb(q, k, pos, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM);
 
     // ---- Update KV cache ----
-    int cache_pos = kv->len;
-    memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
-    memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
-    kv->len++;
+    kv_cache_append(kv, k, v);
 
     // ---- Scaled dot-product attention ----
     // GQA: NUM_ATTN_HEADS=32 heads, NUM_KV_HEADS=2 kv heads
@@ -2277,13 +3048,21 @@ static void full_attention_forward(
 
         // Compute attention scores for all cached positions
         float *scores = malloc(kv->len * sizeof(float));
-        for (int p = 0; p < kv->len; p++) {
-            float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
-            float dot = 0.0f;
-            for (int d = 0; d < HEAD_DIM; d++) {
-                dot += qh[d] * kp[d];
+        int score_idx = 0;
+        int head_offset = kv_h * HEAD_DIM;
+        for (int b = 0; b < kv->num_blocks; b++) {
+            KVColdBlock *block = &kv->blocks[b];
+            for (int p = 0; p < block->count; p++) {
+                const int8_t *kq = block->k_q + (size_t)p * kv_dim;
+                const float *ks = block->k_scales + (size_t)p * kv_groups_total();
+                scores[score_idx++] = kv_quantized_dot_head(kq, ks, qh, head_offset) * scale;
             }
-            scores[p] = dot * scale;
+        }
+        for (int p = 0; p < kv->hot_len; p++) {
+            float *kp = kv->k_hot + (size_t)p * kv_dim + head_offset;
+            float dot = 0.0f;
+            for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
+            scores[score_idx++] = dot * scale;
         }
 
         // Softmax
@@ -2291,11 +3070,19 @@ static void full_attention_forward(
 
         // Weighted sum of values
         float *oh = attn_out + h * HEAD_DIM;
-        for (int p = 0; p < kv->len; p++) {
-            float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-            for (int d = 0; d < HEAD_DIM; d++) {
-                oh[d] += scores[p] * vp[d];
+        int score_pos = 0;
+        for (int b = 0; b < kv->num_blocks; b++) {
+            KVColdBlock *block = &kv->blocks[b];
+            for (int p = 0; p < block->count; p++) {
+                const int8_t *vq = block->v_q + (size_t)p * kv_dim;
+                const float *vs = block->v_scales + (size_t)p * kv_groups_total();
+                kv_quantized_accumulate_head(oh, vq, vs, head_offset, scores[score_pos++]);
             }
+        }
+        for (int p = 0; p < kv->hot_len; p++) {
+            float *vp = kv->v_hot + (size_t)p * kv_dim + head_offset;
+            for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[score_pos] * vp[d];
+            score_pos++;
         }
         free(scores);
     }
@@ -2731,7 +3518,7 @@ static void moe_forward(
         size_t esz = active_expert_size();
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
-            off_t expert_offset = (off_t)eidx * esz;
+            off_t expert_offset = expert_file_offset(layer_idx, eidx);
 
             if (g_metal && g_metal->buf_expert_data) {
                 // GPU path: pread directly into Metal buffer, run gate+up+swiglu+down on GPU
@@ -3070,7 +3857,7 @@ typedef struct {
 } AsyncPreadState;
 static AsyncPreadState g_async_pread = {0};
 
-static void async_pread_start(int packed_fd, int *expert_indices, int K,
+static void async_pread_start(int layer_idx, int packed_fd, int *expert_indices, int K,
                                id<MTLBuffer> __strong *dst_bufs, const void *mmap_base) {
     size_t esz = active_expert_size();
     g_async_pread.num_tasks = K;
@@ -3080,7 +3867,7 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     for (int k = 0; k < K; k++) {
         g_async_pread.tasks[k].fd = packed_fd;
         g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
-        g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
+        g_async_pread.tasks[k].offset = expert_file_offset(layer_idx, expert_indices[k]);
         g_async_pread.tasks[k].size = esz;
         g_async_pread.tasks[k].result = 0;
     }
@@ -3122,6 +3909,7 @@ static void io_pool_shutdown(void) {
 // Parallel pread of K experts into Metal buffers using pthreads.
 // Returns number of successfully loaded experts, sets valid[] flags.
 static int parallel_pread_experts(
+    int layer_idx,
     int packed_fd,
     int *expert_indices,
     int K,
@@ -3133,7 +3921,7 @@ static int parallel_pread_experts(
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
-        tasks[k].offset = (off_t)expert_indices[k] * esz;
+        tasks[k].offset = expert_file_offset(layer_idx, expert_indices[k]);
         tasks[k].size = esz;
         tasks[k].result = 0;
         tasks[k].mmap_base = mmap_base;
@@ -3158,6 +3946,7 @@ static int parallel_pread_experts(
 // Same as parallel_pread_experts but reads into caller-specified MTLBuffers.
 // ============================================================================
 static int parallel_pread_experts_into(
+    int layer_idx,
     int packed_fd,
     int *expert_indices,
     int K,
@@ -3169,7 +3958,7 @@ static int parallel_pread_experts_into(
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [dst_bufs[k] contents];
-        tasks[k].offset = (off_t)expert_indices[k] * esz;
+        tasks[k].offset = expert_file_offset(layer_idx, expert_indices[k]);
         tasks[k].size = esz;
         tasks[k].result = 0;
     }
@@ -3581,7 +4370,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
 
 // Build I/O plan on main thread (ARC-safe: extracts void* from id<MTLBuffer>),
 // then signal background prefetch thread.
-static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
+static void infer_prefetch_start(InferPrefetchCtx *pf, int layer_idx, int packed_fd,
                                   int *expert_indices, int K,
                                   id<MTLBuffer> __strong *dst_bufs) {
     pthread_mutex_lock(&pf->mutex);
@@ -3591,7 +4380,7 @@ static void infer_prefetch_start(InferPrefetchCtx *pf, int packed_fd,
     plan->K = K;
     for (int k = 0; k < K; k++) {
         plan->dst[k] = [dst_bufs[k] contents];
-        plan->offset[k] = (off_t)expert_indices[k] * esz;
+        plan->offset[k] = expert_file_offset(layer_idx, expert_indices[k]);
         plan->valid[k] = 0;
     }
     plan->loaded = 0;
@@ -3951,6 +4740,7 @@ static float *s_shared_gate = NULL; // [SHARED_INTERMEDIATE]
 static float *s_shared_up  = NULL;  // [SHARED_INTERMEDIATE]
 static float *s_moe_out   = NULL;   // [HIDDEN_DIM]
 static float *s_shared_out = NULL;  // [HIDDEN_DIM]
+static float *s_final_norm = NULL;  // [HIDDEN_DIM]
 // Full attention scratch
 static float *s_q_proj_out = NULL;  // [NUM_ATTN_HEADS * HEAD_DIM * 2]
 static float *s_k_proj_out = NULL;  // [NUM_KV_HEADS * HEAD_DIM]
@@ -3980,6 +4770,7 @@ static void init_layer_scratch(void) {
     s_shared_up  = calloc(SHARED_INTERMEDIATE, sizeof(float));
     s_moe_out    = calloc(HIDDEN_DIM, sizeof(float));
     s_shared_out = calloc(HIDDEN_DIM, sizeof(float));
+    s_final_norm = calloc(HIDDEN_DIM, sizeof(float));
     s_q_proj_out = calloc(NUM_ATTN_HEADS * HEAD_DIM * 2, sizeof(float));
     s_k_proj_out = calloc(NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     s_v_proj_out = calloc(NUM_KV_HEADS * HEAD_DIM, sizeof(float));
@@ -4208,7 +4999,7 @@ static void fused_layer_forward(
         // Predicted experts that hit page cache (same as previous token) complete in ~0.1ms.
         if (g_pred_enabled && g_pred_generating && g_pred_valid && packed_fd >= 0 &&
             g_metal->buf_multi_expert_data_B[0] && g_pred_count[layer_idx] > 0) {
-            async_pread_start(packed_fd, g_pred_experts[layer_idx],
+            async_pread_start(layer_idx, packed_fd, g_pred_experts[layer_idx],
                               g_pred_count[layer_idx],
                               g_metal->buf_multi_expert_data_B, mmap_base);
             pred_started = 1;
@@ -4407,7 +5198,7 @@ static void fused_layer_forward(
                     if (buf && cidx >= 0) {
                         int fd_copy = packed_fd;
                         void *dst = g_malloc_cache->data[cidx];
-                        off_t offset = (off_t)eidx * spec_esz;
+                        off_t offset = expert_file_offset(layer_idx, eidx);
                         size_t sz = spec_esz;
                         dispatch_group_async(spec_group, g_io_gcd_queue, ^{
                             pread(fd_copy, dst, sz, offset);
@@ -4427,7 +5218,7 @@ static void fused_layer_forward(
                     if (buf) {
                         int fd_copy = packed_fd;
                         void *dst = [buf contents];
-                        off_t offset = (off_t)eidx * spec_esz;
+                        off_t offset = expert_file_offset(layer_idx, eidx);
                         size_t sz = spec_esz;
                         dispatch_group_async(spec_group, g_io_gcd_queue, ^{
                             pread(fd_copy, dst, sz, offset);
@@ -4516,19 +5307,19 @@ static void fused_layer_forward(
         // RoPE
         apply_rotary_emb(q, k_out, pos, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM);
 
-        // Update KV cache (CPU + GPU mirror)
+        // Update KV cache (CPU + optional GPU mirror)
         int cache_pos = kv->len;
-        memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
-        memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
-
+        int kv_can_gpu_mirror = kv_cache_gpu_compatible(kv) &&
+                                (!kv_quant_enabled() || (kv->hot_len + 1) <= g_kv_hot_window);
+        kv_cache_append(kv, k_out, v_out);
         int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
-        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+        if (kv_can_gpu_mirror && g_metal && g_metal->attn_scores_pipe &&
+            fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
             memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
                    k_out, kv_dim * sizeof(float));
             memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
                    v_out, kv_dim * sizeof(float));
         }
-        kv->len++;
 
         // Scaled dot-product attention (GQA) — GPU or CPU
         int heads_per_kv = NUM_ATTN_HEADS / NUM_KV_HEADS;
@@ -4540,6 +5331,7 @@ static void fused_layer_forward(
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS &&
+                              kv_cache_gpu_compatible(kv) &&
                               kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
         if (gpu_attn_ready) {
@@ -4553,17 +5345,37 @@ static void fused_layer_forward(
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * HEAD_DIM;
                 float *scores = malloc(kv->len * sizeof(float));
-                for (int p = 0; p < kv->len; p++) {
-                    float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
+                int head_offset = kv_h * HEAD_DIM;
+                int score_idx = 0;
+                for (int b = 0; b < kv->num_blocks; b++) {
+                    KVColdBlock *block = &kv->blocks[b];
+                    for (int p = 0; p < block->count; p++) {
+                        const int8_t *kq = block->k_q + (size_t)p * kv_dim;
+                        const float *ks = block->k_scales + (size_t)p * kv_groups_total();
+                        scores[score_idx++] = kv_quantized_dot_head(kq, ks, qh, head_offset) * scale;
+                    }
+                }
+                for (int p = 0; p < kv->hot_len; p++) {
+                    float *kp = kv->k_hot + (size_t)p * kv_dim + head_offset;
                     float dot = 0.0f;
                     for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
-                    scores[p] = dot * scale;
+                    scores[score_idx++] = dot * scale;
                 }
                 cpu_softmax(scores, kv->len);
                 float *oh = attn_out + h * HEAD_DIM;
-                for (int p = 0; p < kv->len; p++) {
-                    float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-                    for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+                int score_pos = 0;
+                for (int b = 0; b < kv->num_blocks; b++) {
+                    KVColdBlock *block = &kv->blocks[b];
+                    for (int p = 0; p < block->count; p++) {
+                        const int8_t *vq = block->v_q + (size_t)p * kv_dim;
+                        const float *vs = block->v_scales + (size_t)p * kv_groups_total();
+                        kv_quantized_accumulate_head(oh, vq, vs, head_offset, scores[score_pos++]);
+                    }
+                }
+                for (int p = 0; p < kv->hot_len; p++) {
+                    float *vp = kv->v_hot + (size_t)p * kv_dim + head_offset;
+                    for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[score_pos] * vp[d];
+                    score_pos++;
                 }
                 free(scores);
             }
@@ -5120,7 +5932,7 @@ static void fused_layer_forward(
                     int cidx = miss_cache_idx[m];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     tasks[m].dst = g_malloc_cache->data[cidx];
-                    tasks[m].offset = (off_t)expert_indices[k] * esz;
+                    tasks[m].offset = expert_file_offset(layer_idx, expert_indices[k]);
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = NULL;  // always pread for cache population
@@ -5175,7 +5987,7 @@ static void fused_layer_forward(
                     int k = miss_indices[m];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
                     tasks[m].dst = [miss_bufs[m] contents];
-                    tasks[m].offset = (off_t)expert_indices[k] * esz;
+                    tasks[m].offset = expert_file_offset(layer_idx, expert_indices[k]);
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                     tasks[m].mmap_base = mmap_base;
@@ -5236,7 +6048,7 @@ static void fused_layer_forward(
                     int k = miss_k_slots[m];
                     tasks[m].fd = packed_fd;
                     tasks[m].dst = [g_metal->buf_multi_expert_data[k] contents];
-                    tasks[m].offset = (off_t)miss_ei[m] * esz;
+                    tasks[m].offset = expert_file_offset(layer_idx, miss_ei[m]);
                     tasks[m].size = esz;
                     tasks[m].result = 0;
                 }
@@ -5251,7 +6063,8 @@ static void fused_layer_forward(
             size_t esz = active_expert_size();
             InferPreadTask tasks[MAX_K];
             for (int k = 0; k < actual_K; k++) {
-                LZ4IndexEntry *ie = &g_lz4_index[layer_idx][expert_indices[k]];
+                int physical_eidx = map_expert_to_physical(layer_idx, expert_indices[k]);
+                LZ4IndexEntry *ie = &g_lz4_index[layer_idx][physical_eidx];
                 tasks[k].fd = packed_fd;
                 tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
                 tasks[k].offset = ie->offset;
@@ -5268,7 +6081,7 @@ static void fused_layer_forward(
             }
         } else {
             // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
-            async_pread_start(packed_fd, expert_indices, actual_K,
+            async_pread_start(layer_idx, packed_fd, expert_indices, actual_K,
                               g_metal->buf_multi_expert_data, mmap_base);
             for (int k = 0; k < actual_K; k++) {
                 expert_bufs[k] = g_metal->buf_multi_expert_data[k];
@@ -5365,12 +6178,12 @@ static void fused_layer_forward(
             // Prepare combine params: expert_weights[0..K-1] + shared_gate_score
             {
                 float *params = (float *)[g_metal->buf_combine_params contents];
-                // Zero all 10 slots first (unused experts get weight=0)
-                memset(params, 0, 10 * sizeof(float));
+                // Zero all slots first (unused experts get weight=0)
+                memset(params, 0, (MAX_K + 2) * sizeof(float));
                 for (int k = 0; k < actual_K; k++) {
                     params[k] = valid[k] ? expert_weights[k] : 0.0f;
                 }
-                params[8] = shared_gate_score;
+                params[MAX_K] = shared_gate_score;
             }
 
             // Enc C1: moe_combine_residual
@@ -5380,15 +6193,15 @@ static void fused_layer_forward(
                 [enc setBuffer:g_metal->buf_h_mid         offset:0 atIndex:0];   // h_mid
                 [enc setBuffer:g_metal->buf_shared_out    offset:0 atIndex:1];   // shared_out
                 [enc setBuffer:g_metal->buf_moe_hidden    offset:0 atIndex:2];   // output: hidden
-                // Bind all 8 expert output buffers (unused ones have weight=0 in params)
+                // Bind all expert output buffers (unused ones have weight=0 in params)
                 for (int k = 0; k < MAX_K; k++) {
                     [enc setBuffer:g_metal->buf_multi_expert_out[k] offset:0 atIndex:(3 + k)];
                 }
-                [enc setBuffer:g_metal->buf_combine_params offset:0 atIndex:11]; // params
+                [enc setBuffer:g_metal->buf_combine_params offset:0 atIndex:(3 + MAX_K)]; // params
                 uint32_t dim = HIDDEN_DIM;
                 uint32_t k_val = (uint32_t)actual_K;
-                [enc setBytes:&dim   length:4 atIndex:12];
-                [enc setBytes:&k_val length:4 atIndex:13];
+                [enc setBytes:&dim   length:4 atIndex:(4 + MAX_K)];
+                [enc setBytes:&k_val length:4 atIndex:(5 + MAX_K)];
                 uint32_t tgs = (dim + 255) / 256;
                 [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -5467,7 +6280,7 @@ static void fused_layer_forward(
         float *expert_out_cpu = malloc(HIDDEN_DIM * sizeof(float));
         for (int k = 0; k < K; k++) {
             int eidx = expert_indices[k];
-            off_t expert_offset = (off_t)eidx * esz;
+            off_t expert_offset = expert_file_offset(layer_idx, eidx);
             void *expert_data = malloc(esz);
             ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
             if (nread != (ssize_t)esz) {
@@ -5679,6 +6492,7 @@ static int read_http_request(int fd, char *buf, int bufsz) {
 // Extract the last "content" value from an OpenAI messages array.
 // Minimal JSON parsing: find last "content":" and extract the string value.
 // Returns pointer into buf (null-terminated in place), or NULL.
+__attribute__((unused))
 static char *extract_last_content(char *buf) {
     char *last = NULL;
     char *p = buf;
@@ -5721,18 +6535,9 @@ static char *extract_last_content(char *buf) {
     return last;
 }
 
-// Extract "max_tokens" or "max_completion_tokens" from JSON body. Returns value or default.
-static int extract_max_tokens(const char *buf, int default_val) {
-    const char *p = strstr(buf, "\"max_completion_tokens\"");
-    if (!p) p = strstr(buf, "\"max_tokens\"");
-    if (!p) return default_val;
-    p = strchr(p, ':');
-    if (!p) return default_val;
-    return atoi(p + 1);
-}
-
 // Save a conversation turn to ~/.flash-moe/sessions/<session_id>.jsonl
 // Shared data store with the chat client.
+__attribute__((unused))
 static void server_save_turn(const char *session_id, const char *role, const char *content) {
     if (!session_id || !session_id[0] || !content) return;
     const char *home = getenv("HOME");
@@ -5767,21 +6572,189 @@ static void server_save_turn(const char *session_id, const char *role, const cha
     fclose(f);
 }
 
-// Extract "session_id" string from JSON body. Copies into out_buf (max out_size).
-// Returns 1 if found, 0 if missing.
-static int extract_session_id(const char *buf, char *out_buf, int out_size) {
-    const char *p = strstr(buf, "\"session_id\"");
-    if (!p) return 0;
-    p += 12; // skip "session_id"
-    while (*p == ' ' || *p == '\t' || *p == ':') p++;
-    if (*p != '"') return 0;
-    p++; // skip opening quote
-    int i = 0;
-    while (*p && *p != '"' && i < out_size - 1) {
-        out_buf[i++] = *p++;
+typedef struct {
+    char *role;
+    char *content;
+} ChatMessage;
+
+typedef struct {
+    ChatMessage *items;
+    int count;
+    int has_explicit_system;
+} ChatMessages;
+
+typedef struct {
+    ChatMessages messages;
+    int max_tokens;
+    int stream;
+    SamplerConfig sampler;
+    char session_id[64];
+    int has_session;
+} ChatRequest;
+
+static void chat_messages_free(ChatMessages *messages) {
+    if (!messages || !messages->items) return;
+    for (int i = 0; i < messages->count; i++) {
+        free(messages->items[i].role);
+        free(messages->items[i].content);
     }
-    out_buf[i] = '\0';
-    return i > 0 ? 1 : 0;
+    free(messages->items);
+    messages->items = NULL;
+    messages->count = 0;
+    messages->has_explicit_system = 0;
+}
+
+static void chat_request_free(ChatRequest *req) {
+    if (!req) return;
+    chat_messages_free(&req->messages);
+}
+
+static char *load_system_prompt(void);
+
+static int chat_request_single_user_turn(const ChatRequest *req) {
+    return req && req->messages.count == 1 &&
+           strcmp(req->messages.items[0].role, "user") == 0;
+}
+
+static const char *default_system_prompt_text(void) {
+    static char *cached = NULL;
+    if (!cached) cached = load_system_prompt();
+    return cached;
+}
+
+static PromptTokens *tokenize_system_prompt_only(const char *system_prompt) {
+    const char *prefix = "<|im_start|>system\n";
+    const char *suffix = "<|im_end|>\n";
+    size_t total = strlen(prefix) + strlen(system_prompt) + strlen(suffix) + 1;
+    char *prompt = malloc(total);
+    if (!prompt) return NULL;
+    snprintf(prompt, total, "%s%s%s", prefix, system_prompt, suffix);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    free(prompt);
+    return pt;
+}
+
+static char *build_chat_prompt_string(const ChatMessages *messages, const char *fallback_system) {
+    NSMutableString *prompt = [NSMutableString string];
+    if (!messages->has_explicit_system && fallback_system && fallback_system[0]) {
+        [prompt appendFormat:@"<|im_start|>system\n%s<|im_end|>\n", fallback_system];
+    }
+    for (int i = 0; i < messages->count; i++) {
+        [prompt appendFormat:@"<|im_start|>%s\n%s<|im_end|>\n",
+                             messages->items[i].role, messages->items[i].content];
+    }
+    [prompt appendString:@"<|im_start|>assistant\n"];
+    return strdup(prompt.UTF8String);
+}
+
+static int parse_chat_request_json(const char *body, ChatRequest *out, char *err, size_t err_cap) {
+    memset(out, 0, sizeof(*out));
+    out->max_tokens = 8192;
+    out->stream = 1;
+    out->sampler.temperature = 0.7f;
+    out->sampler.top_p = 0.9f;
+    out->sampler.top_k = 40;
+    out->sampler.presence_penalty = 0.0f;
+    out->sampler.frequency_penalty = 0.0f;
+    out->sampler.repetition_penalty = 1.05f;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    out->sampler.rng_state = ((uint64_t)tv.tv_sec << 20) ^ (uint64_t)tv.tv_usec ^ ((uint64_t)getpid() << 32);
+
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytes:body length:strlen(body)];
+        NSError *json_error = nil;
+        id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&json_error];
+        if (![root isKindOfClass:[NSDictionary class]]) {
+            snprintf(err, err_cap, "%s", "invalid JSON body");
+            return 0;
+        }
+        NSDictionary *dict = (NSDictionary *)root;
+
+        id messages_obj = dict[@"messages"];
+        if (![messages_obj isKindOfClass:[NSArray class]] || [messages_obj count] == 0) {
+            snprintf(err, err_cap, "%s", "`messages` must be a non-empty array");
+            return 0;
+        }
+        NSArray *messages = (NSArray *)messages_obj;
+        out->messages.count = (int)messages.count;
+        out->messages.items = calloc((size_t)out->messages.count, sizeof(ChatMessage));
+
+        NSString *last_non_system_role = nil;
+        for (NSUInteger i = 0; i < messages.count; i++) {
+            id msg_obj = messages[i];
+            if (![msg_obj isKindOfClass:[NSDictionary class]]) {
+                snprintf(err, err_cap, "%s", "each message must be an object");
+                chat_request_free(out);
+                return 0;
+            }
+            NSDictionary *msg = (NSDictionary *)msg_obj;
+            id role_obj = msg[@"role"];
+            id content_obj = msg[@"content"];
+            if (![role_obj isKindOfClass:[NSString class]]) {
+                snprintf(err, err_cap, "%s", "message.role must be a string");
+                chat_request_free(out);
+                return 0;
+            }
+            if (![content_obj isKindOfClass:[NSString class]]) {
+                snprintf(err, err_cap, "%s", "only string message.content is supported");
+                chat_request_free(out);
+                return 0;
+            }
+            NSString *role = (NSString *)role_obj;
+            if (![role isEqualToString:@"system"] &&
+                ![role isEqualToString:@"user"] &&
+                ![role isEqualToString:@"assistant"]) {
+                snprintf(err, err_cap, "unsupported role: %s", role.UTF8String);
+                chat_request_free(out);
+                return 0;
+            }
+            if ([role isEqualToString:@"system"]) out->messages.has_explicit_system = 1;
+            else last_non_system_role = role;
+
+            out->messages.items[i].role = strdup(role.UTF8String);
+            out->messages.items[i].content = strdup(((NSString *)content_obj).UTF8String ?: "");
+        }
+
+        if (!last_non_system_role || ![last_non_system_role isEqualToString:@"user"]) {
+            snprintf(err, err_cap, "%s", "last non-system message must have role `user`");
+            chat_request_free(out);
+            return 0;
+        }
+
+        NSNumber *max_completion_tokens = dict[@"max_completion_tokens"];
+        NSNumber *max_tokens = dict[@"max_tokens"];
+        NSNumber *stream = dict[@"stream"];
+        NSNumber *temperature = dict[@"temperature"];
+        NSNumber *top_p = dict[@"top_p"];
+        NSNumber *top_k = dict[@"top_k"];
+        NSNumber *presence_penalty = dict[@"presence_penalty"];
+        NSNumber *frequency_penalty = dict[@"frequency_penalty"];
+        NSNumber *repetition_penalty = dict[@"repetition_penalty"];
+        NSNumber *seed = dict[@"seed"];
+        NSString *session_id = dict[@"session_id"];
+
+        NSNumber *tokens_num = [max_completion_tokens isKindOfClass:[NSNumber class]] ? max_completion_tokens :
+                               ([max_tokens isKindOfClass:[NSNumber class]] ? max_tokens : nil);
+        if (tokens_num) out->max_tokens = MAX(1, MIN(32768, tokens_num.intValue));
+        if ([stream isKindOfClass:[NSNumber class]]) out->stream = stream.boolValue ? 1 : 0;
+        if ([temperature isKindOfClass:[NSNumber class]]) out->sampler.temperature = MAX(0.0f, temperature.floatValue);
+        if ([top_p isKindOfClass:[NSNumber class]]) out->sampler.top_p = top_p.floatValue;
+        if ([top_k isKindOfClass:[NSNumber class]]) out->sampler.top_k = top_k.intValue;
+        if ([presence_penalty isKindOfClass:[NSNumber class]]) out->sampler.presence_penalty = presence_penalty.floatValue;
+        if ([frequency_penalty isKindOfClass:[NSNumber class]]) out->sampler.frequency_penalty = frequency_penalty.floatValue;
+        if ([repetition_penalty isKindOfClass:[NSNumber class]]) out->sampler.repetition_penalty = repetition_penalty.floatValue;
+        if ([seed isKindOfClass:[NSNumber class]]) out->sampler.rng_state = seed.unsignedLongLongValue ?: 1ULL;
+        if ([session_id isKindOfClass:[NSString class]] && session_id.length > 0) {
+            snprintf(out->session_id, sizeof(out->session_id), "%s", session_id.UTF8String);
+            out->has_session = 1;
+        }
+    }
+
+    if (out->sampler.top_p <= 0.0f || out->sampler.top_p > 1.0f) out->sampler.top_p = 0.9f;
+    if (out->sampler.top_k < 0) out->sampler.top_k = 0;
+    if (out->sampler.repetition_penalty < 1.0f) out->sampler.repetition_penalty = 1.0f;
+    return 1;
 }
 
 // Write a full HTTP response string to fd
@@ -5905,42 +6878,6 @@ static char *load_system_prompt(void) {
     return strdup("You are a helpful assistant. /think");
 }
 
-// Tokenize a full chat message (system prompt + user turn) for first-time use.
-static PromptTokens *tokenize_chat_message(const char *user_content) {
-    static char *sys_prompt_text = NULL;
-    if (!sys_prompt_text) sys_prompt_text = load_system_prompt();
-
-    // Build: <|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
-    size_t sys_len = strlen(sys_prompt_text);
-    size_t user_len = strlen(user_content);
-    size_t total = 30 + sys_len + 30 + user_len + 40;  // generous padding for tags
-    char *prompt = malloc(total);
-    if (!prompt) return NULL;
-    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-             sys_prompt_text, user_content);
-    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
-    free(prompt);
-    return pt;
-}
-
-// Keep old signature for backward compat (unused but prevents compiler warning)
-__attribute__((unused))
-static PromptTokens *tokenize_chat_message_old(const char *user_content) {
-    const char *prefix =
-        "<|im_start|>system\nYou are a helpful assistant. /think<|im_end|>\n"
-        "<|im_start|>user\n";
-    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
-
-    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
-    char *prompt = malloc(prompt_len);
-    if (!prompt) return NULL;
-
-    snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
-    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
-    free(prompt);
-    return pt;
-}
-
 // The main serve loop. Model state must already be initialized.
 // Sync CPU linear attention state → GPU buffers
 static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
@@ -5960,6 +6897,236 @@ static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
         }
         li++;
     }
+}
+
+typedef struct {
+    float *k_snapshot;
+    float *v_snapshot;
+    int len;
+} KVSnapshot;
+
+typedef struct {
+    int in_use;
+    char session_id[64];
+    uint64_t last_used;
+    int pos;
+    KVSnapshot kv[NUM_LAYERS];
+    float *la_conv[NUM_LAYERS];
+    float *la_ssm[NUM_LAYERS];
+    uint32_t *token_counts;
+} SessionState;
+
+static void kv_snapshot_free(KVSnapshot *snap) {
+    if (!snap) return;
+    free(snap->k_snapshot);
+    free(snap->v_snapshot);
+    snap->k_snapshot = NULL;
+    snap->v_snapshot = NULL;
+    snap->len = 0;
+}
+
+static void session_state_clear(SessionState *session) {
+    if (!session) return;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        kv_snapshot_free(&session->kv[i]);
+        free(session->la_conv[i]);
+        free(session->la_ssm[i]);
+        session->la_conv[i] = NULL;
+        session->la_ssm[i] = NULL;
+    }
+    free(session->token_counts);
+    session->token_counts = NULL;
+    session->in_use = 0;
+    session->session_id[0] = '\0';
+    session->last_used = 0;
+    session->pos = 0;
+}
+
+static SessionState *session_find(SessionState *sessions, const char *session_id) {
+    if (!session_id || !session_id[0]) return NULL;
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; i++) {
+        if (sessions[i].in_use && strcmp(sessions[i].session_id, session_id) == 0) {
+            return &sessions[i];
+        }
+    }
+    return NULL;
+}
+
+static SessionState *session_acquire(SessionState *sessions, const char *session_id, uint64_t clock) {
+    SessionState *existing = session_find(sessions, session_id);
+    if (existing) {
+        existing->last_used = clock;
+        return existing;
+    }
+
+    SessionState *slot = NULL;
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; i++) {
+        if (!sessions[i].in_use) {
+            slot = &sessions[i];
+            break;
+        }
+    }
+    if (!slot) {
+        slot = &sessions[0];
+        for (int i = 1; i < MAX_ACTIVE_SESSIONS; i++) {
+            if (sessions[i].last_used < slot->last_used) slot = &sessions[i];
+        }
+        session_state_clear(slot);
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->in_use = 1;
+    slot->last_used = clock;
+    snprintf(slot->session_id, sizeof(slot->session_id), "%s", session_id);
+    slot->token_counts = calloc(VOCAB_SIZE, sizeof(uint32_t));
+    return slot;
+}
+
+static int session_active_count(SessionState *sessions) {
+    int active = 0;
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; i++) {
+        if (sessions[i].in_use) active++;
+    }
+    return active;
+}
+
+static void session_capture_runtime(
+    SessionState *session,
+    KVCache **kv_caches,
+    void **layer_states,
+    size_t kv_dim,
+    size_t conv_state_size,
+    size_t ssm_state_size,
+    int pos,
+    const uint32_t *token_counts
+) {
+    if (!session) return;
+    session->pos = pos;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        kv_snapshot_free(&session->kv[i]);
+        if (kv_caches[i] && kv_caches[i]->len > 0) {
+            size_t sz = (size_t)kv_caches[i]->len * kv_dim * sizeof(float);
+            session->kv[i].k_snapshot = malloc(sz);
+            session->kv[i].v_snapshot = malloc(sz);
+            kv_cache_copy_raw(kv_caches[i], session->kv[i].k_snapshot, session->kv[i].v_snapshot);
+            session->kv[i].len = kv_caches[i]->len;
+        }
+        free(session->la_conv[i]);
+        free(session->la_ssm[i]);
+        session->la_conv[i] = NULL;
+        session->la_ssm[i] = NULL;
+        if (layer_states[i]) {
+            LinearAttnState *s = (LinearAttnState *)layer_states[i];
+            session->la_conv[i] = malloc(conv_state_size);
+            session->la_ssm[i] = malloc(ssm_state_size);
+            memcpy(session->la_conv[i], s->conv_state, conv_state_size);
+            memcpy(session->la_ssm[i], s->ssm_state, ssm_state_size);
+        }
+    }
+    if (!session->token_counts) session->token_counts = calloc(VOCAB_SIZE, sizeof(uint32_t));
+    if (token_counts) memcpy(session->token_counts, token_counts, VOCAB_SIZE * sizeof(uint32_t));
+}
+
+static void session_restore_runtime(
+    SessionState *session,
+    KVCache **kv_caches,
+    void **layer_states,
+    size_t kv_dim,
+    size_t conv_state_size,
+    size_t ssm_state_size
+) {
+    if (!session) return;
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if (kv_caches[i]) {
+            if (session->kv[i].k_snapshot && session->kv[i].len > 0) {
+                size_t sz = (size_t)session->kv[i].len * kv_dim * sizeof(float);
+                kv_cache_load_raw(kv_caches[i], session->kv[i].k_snapshot, session->kv[i].v_snapshot, session->kv[i].len);
+                if (g_metal && kv_cache_gpu_compatible(kv_caches[i]) && session->kv[i].len < GPU_KV_SEQ) {
+                    int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
+                    if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+                        memcpy([g_metal->buf_kv_k[fa_idx] contents], kv_caches[i]->k_hot, sz);
+                        memcpy([g_metal->buf_kv_v[fa_idx] contents], kv_caches[i]->v_hot, sz);
+                    }
+                }
+            } else {
+                kv_cache_reset(kv_caches[i]);
+            }
+        }
+        if (layer_states[i]) {
+            LinearAttnState *s = (LinearAttnState *)layer_states[i];
+            if (session->la_conv[i] && session->la_ssm[i]) {
+                memcpy(s->conv_state, session->la_conv[i], conv_state_size);
+                memcpy(s->ssm_state, session->la_ssm[i], ssm_state_size);
+            } else {
+                memset(s->conv_state, 0, conv_state_size);
+                memset(s->ssm_state, 0, ssm_state_size);
+            }
+        }
+    }
+    sync_cpu_to_gpu_delta_state_serve(layer_states);
+}
+
+static void reset_runtime_state(
+    KVCache **kv_caches,
+    void **layer_states,
+    size_t conv_state_size,
+    size_t ssm_state_size
+) {
+    for (int i = 0; i < NUM_LAYERS; i++) {
+        if (kv_caches[i]) kv_cache_reset(kv_caches[i]);
+        if (layer_states[i]) {
+            LinearAttnState *s = (LinearAttnState *)layer_states[i];
+            memset(s->conv_state, 0, conv_state_size);
+            memset(s->ssm_state, 0, ssm_state_size);
+        }
+    }
+    sync_cpu_to_gpu_delta_state_serve(layer_states);
+}
+
+static char *json_escape_alloc(const char *src) {
+    size_t len = strlen(src);
+    char *escaped = malloc(len * 2 + 1);
+    if (!escaped) return NULL;
+    char *w = escaped;
+    for (const char *r = src; *r; r++) {
+        switch (*r) {
+            case '"':  *w++ = '\\'; *w++ = '"'; break;
+            case '\\': *w++ = '\\'; *w++ = '\\'; break;
+            case '\n': *w++ = '\\'; *w++ = 'n'; break;
+            case '\r': *w++ = '\\'; *w++ = 'r'; break;
+            case '\t': *w++ = '\\'; *w++ = 't'; break;
+            default:   *w++ = *r; break;
+        }
+    }
+    *w = '\0';
+    return escaped;
+}
+
+static void send_chat_json_response(int fd, const char *request_id, const char *content) {
+    char *escaped = json_escape_alloc(content ? content : "");
+    if (!escaped) return;
+    size_t body_cap = strlen(escaped) + 1024;
+    char *body = malloc(body_cap);
+    if (!body) {
+        free(escaped);
+        return;
+    }
+    int body_len = snprintf(body, body_cap,
+                            "{\"id\":\"%s\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}]}",
+                            request_id, escaped);
+    char header[256];
+    int header_len = snprintf(header, sizeof(header),
+                              "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: application/json\r\n"
+                              "Access-Control-Allow-Origin: *\r\n"
+                              "Content-Length: %d\r\n"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              body_len);
+    http_write(fd, header, header_len);
+    http_write(fd, body, body_len);
+    free(body);
+    free(escaped);
 }
 
 static void serve_loop(
@@ -5996,13 +7163,21 @@ static void serve_loop(
     fflush(stdout);
 
     static uint64_t req_counter = 0;
+    uint64_t session_clock = 0;
+    SessionState sessions[MAX_ACTIVE_SESSIONS];
+    memset(sessions, 0, sizeof(sessions));
+    char server_instance_id[64];
+    struct timeval server_tv;
+    gettimeofday(&server_tv, NULL);
+    snprintf(server_instance_id, sizeof(server_instance_id), "srv-%d-%ld%06d",
+             (int)getpid(), (long)server_tv.tv_sec, (int)server_tv.tv_usec);
 
     // ---- System prompt cache: prefill system prompt once at startup ----
     // Tokenize the system prompt and run it through all 60 layers.
     // Save the resulting KV cache + linear attention state as a snapshot.
     // On each request, restore the snapshot instead of re-prefilling.
     fprintf(stderr, "[serve] Pre-caching system prompt...\n");
-    PromptTokens *sys_pt = tokenize_chat_message("");  // empty user = just system prompt
+    PromptTokens *sys_pt = tokenize_system_prompt_only(default_system_prompt_text());
     int sys_pos = 0;
     if (sys_pt && sys_pt->count > 0) {
         // Pre-embed all system prompt tokens
@@ -6060,15 +7235,13 @@ static void serve_loop(
         sync_cpu_to_gpu_delta_state_serve(layer_states);
         fprintf(stderr, "[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
     }
-    free(sys_pt);
+    if (sys_pt) {
+        free(sys_pt->ids);
+        free(sys_pt);
+    }
 
     // Save snapshot of KV caches + linear attention state after system prompt
     // These are restored at the start of each request instead of resetting to zero
-    typedef struct {
-        float *k_snapshot;
-        float *v_snapshot;
-        int len;
-    } KVSnapshot;
     KVSnapshot kv_snapshots[NUM_LAYERS];
     memset(kv_snapshots, 0, sizeof(kv_snapshots));
 
@@ -6087,8 +7260,7 @@ static void serve_loop(
             size_t sz = sys_pos * kv_dim * sizeof(float);
             kv_snapshots[i].k_snapshot = malloc(sz);
             kv_snapshots[i].v_snapshot = malloc(sz);
-            memcpy(kv_snapshots[i].k_snapshot, kv_caches[i]->k_cache, sz);
-            memcpy(kv_snapshots[i].v_snapshot, kv_caches[i]->v_cache, sz);
+            kv_cache_copy_raw(kv_caches[i], kv_snapshots[i].k_snapshot, kv_snapshots[i].v_snapshot);
             kv_snapshots[i].len = kv_caches[i]->len;
         }
         if (layer_states[i]) {
@@ -6099,32 +7271,7 @@ static void serve_loop(
             memcpy(la_ssm_snapshots[i], s->ssm_state, ssm_state_size);
         }
     }
-    // Also snapshot GPU delta-net state
-    void *gpu_delta_snapshots[NUM_LINEAR_LAYERS];
-    void *gpu_conv_snapshots[NUM_LINEAR_LAYERS];
-    memset(gpu_delta_snapshots, 0, sizeof(gpu_delta_snapshots));
-    memset(gpu_conv_snapshots, 0, sizeof(gpu_conv_snapshots));
-    if (g_metal && g_metal->delta_net_step) {
-        for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-            if (g_metal->buf_delta_state[i]) {
-                size_t sz = 64*128*128*sizeof(float);
-                gpu_delta_snapshots[i] = malloc(sz);
-                memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
-            }
-            if (g_metal->buf_conv_state[i]) {
-                size_t sz = 3*12288*sizeof(float);
-                gpu_conv_snapshots[i] = malloc(sz);
-                memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
-            }
-        }
-    }
     int sys_prompt_len = sys_pos;  // number of tokens in system prompt cache
-
-    // ---- Session state: track one active conversation session ----
-    // The KV caches + linear attention state ARE the session.
-    // We just track whether to restore from snapshot (new session) or continue (same session).
-    char active_session_id[64] = {0};
-    int session_pos = 0;  // RoPE position after last generation for the active session
 
     for (;;) {
         struct sockaddr_in client_addr;
@@ -6150,14 +7297,26 @@ static void serve_loop(
 
         // GET /health
         if (strcmp(method, "GET") == 0 && strcmp(path, "/health") == 0) {
-            const char *resp =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\"}\n";
-            http_write_str(client_fd, resp);
+            char body[512];
+            int body_len = snprintf(body, sizeof(body),
+                                    "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\",\"server_instance_id\":\"%s\","
+                                    "\"active_sessions\":%d,\"profile\":\"%s\",\"kv_quant\":\"%s\","
+                                    "\"layout_manifest_version\":%d}\n",
+                                    server_instance_id, session_active_count(sessions),
+                                    runtime_profile_name(g_runtime_profile),
+                                    kv_quant_mode_name(g_kv_quant_mode),
+                                    g_layout_manifest.version);
+            char header[256];
+            int header_len = snprintf(header, sizeof(header),
+                                      "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: application/json\r\n"
+                                      "Access-Control-Allow-Origin: *\r\n"
+                                      "Content-Length: %d\r\n"
+                                      "Connection: close\r\n"
+                                      "\r\n",
+                                      body_len);
+            http_write(client_fd, header, header_len);
+            http_write(client_fd, body, body_len);
             free(reqbuf); close(client_fd);
             continue;
         }
@@ -6179,7 +7338,6 @@ static void serve_loop(
 
         // POST /v1/chat/completions
         if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/chat/completions") == 0) {
-            // Find body (after \r\n\r\n)
             char *body = strstr(reqbuf, "\r\n\r\n");
             if (!body) {
                 http_write_str(client_fd,
@@ -6188,124 +7346,109 @@ static void serve_loop(
                 free(reqbuf); close(client_fd); continue;
             }
             body += 4;
-
-            // Extract session_id and max_tokens BEFORE content extraction
-            // (extract_last_content mutates the body buffer in place)
-            int max_gen = extract_max_tokens(body, 8192);
-            if (max_gen > 32768) max_gen = 32768;
-            char req_session_id[64] = {0};
-            int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
-
-            // Extract user content from messages (mutates body — must be last)
-            char *content = extract_last_content(body);
-            if (!content || strlen(content) == 0) {
-                http_write_str(client_fd,
-                    "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
-                    "{\"error\":\"no content in messages\"}\n");
-                free(reqbuf); close(client_fd); continue;
-            }
-            int is_continuation = (has_session &&
-                                   active_session_id[0] != '\0' &&
-                                   strcmp(req_session_id, active_session_id) == 0);
-
-            // Session persistence is handled by the client (chat.m)
-
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
-                    request_id, strlen(content), max_gen,
-                    has_session ? req_session_id : "(none)",
-                    is_continuation ? " [CONTINUE]" : " [NEW]");
-
-            // ---- Tokenize ----
-            // Continuation: prefix with <|im_end|>\n to close prior assistant turn
-            // New session: just the user turn (system prompt restored from snapshot)
-            PromptTokens *pt;
-            if (is_continuation) {
-                pt = tokenize_continuation_turn(content);
-            } else {
-                pt = tokenize_user_turn(content);
+            ChatRequest req;
+            char parse_err[256] = {0};
+            if (!parse_chat_request_json(body, &req, parse_err, sizeof(parse_err))) {
+                char *escaped = json_escape_alloc(parse_err[0] ? parse_err : "invalid request");
+                char resp[1024];
+                snprintf(resp, sizeof(resp),
+                         "HTTP/1.1 400 Bad Request\r\n"
+                         "Content-Type: application/json\r\n"
+                         "Access-Control-Allow-Origin: *\r\n"
+                         "Connection: close\r\n"
+                         "\r\n"
+                         "{\"error\":\"%s\"}\n", escaped ? escaped : "invalid request");
+                free(escaped);
+                http_write_str(client_fd, resp);
+                free(reqbuf); close(client_fd); continue;
             }
+
+            SessionState *session = req.has_session ? session_find(sessions, req.session_id) : NULL;
+            int is_incremental = req.has_session && session && chat_request_single_user_turn(&req);
+            const char *last_content = req.messages.items[req.messages.count - 1].content;
+
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
+                    request_id, strlen(last_content), req.max_tokens,
+                    req.has_session ? req.session_id : "(none)",
+                    is_incremental ? " [CONTINUE]" : " [FULL]");
+
+            PromptTokens *pt = NULL;
+            char *full_prompt = NULL;
+            int pos = 0;
+            uint32_t *token_counts = calloc(VOCAB_SIZE, sizeof(uint32_t));
+
+            if (is_incremental) {
+                session->last_used = ++session_clock;
+                session_restore_runtime(session, kv_caches, layer_states, kv_dim, conv_state_size, ssm_state_size);
+                pos = session->pos;
+                pt = tokenize_continuation_turn(req.messages.items[0].content);
+                if (session->token_counts) {
+                    memcpy(token_counts, session->token_counts, VOCAB_SIZE * sizeof(uint32_t));
+                }
+            } else if (chat_request_single_user_turn(&req) && !req.messages.has_explicit_system) {
+                for (int i = 0; i < NUM_LAYERS; i++) {
+                    if (kv_caches[i] && kv_snapshots[i].k_snapshot && kv_snapshots[i].len > 0) {
+                        size_t sz = (size_t)kv_snapshots[i].len * kv_dim * sizeof(float);
+                        kv_cache_load_raw(kv_caches[i], kv_snapshots[i].k_snapshot, kv_snapshots[i].v_snapshot, kv_snapshots[i].len);
+                        if (g_metal && kv_cache_gpu_compatible(kv_caches[i]) && kv_snapshots[i].len < GPU_KV_SEQ) {
+                            int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
+                            if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+                                memcpy([g_metal->buf_kv_k[fa_idx] contents], kv_caches[i]->k_hot, sz);
+                                memcpy([g_metal->buf_kv_v[fa_idx] contents], kv_caches[i]->v_hot, sz);
+                            }
+                        }
+                    } else if (kv_caches[i]) {
+                        kv_cache_reset(kv_caches[i]);
+                    }
+                    if (layer_states[i]) {
+                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                        if (la_conv_snapshots[i] && la_ssm_snapshots[i]) {
+                            memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
+                            memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
+                        } else {
+                            memset(s->conv_state, 0, conv_state_size);
+                            memset(s->ssm_state, 0, ssm_state_size);
+                        }
+                    }
+                }
+                sync_cpu_to_gpu_delta_state_serve(layer_states);
+                pos = sys_prompt_len;
+                pt = tokenize_user_turn(req.messages.items[0].content);
+            } else {
+                reset_runtime_state(kv_caches, layer_states, conv_state_size, ssm_state_size);
+                reset_delta_net_state();
+                pos = 0;
+                full_prompt = build_chat_prompt_string(&req.messages, default_system_prompt_text());
+                pt = full_prompt ? encode_prompt_text_to_tokens(full_prompt) : NULL;
+            }
+
             if (!pt) {
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"tokenization failed\"}\n");
+                free(full_prompt);
+                free(token_counts);
+                chat_request_free(&req);
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
-                    is_continuation ? " (continuation — skipping snapshot restore)" : "");
-
-            int pos;
-            if (is_continuation) {
-                // ---- Continue from existing session state ----
-                // The KV caches + linear attention state already contain the full
-                // conversation history. Just set pos to where we left off.
-                pos = session_pos;
-            } else {
-                // ---- Restore state from system prompt snapshot ----
-                // Instead of resetting to zero, restore to the cached system prompt state.
-                // This skips re-prefilling the system prompt tokens (~20 tokens, ~6s saved).
-                for (int i = 0; i < NUM_LAYERS; i++) {
-                    if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
-                        size_t sz = sys_prompt_len * kv_dim * sizeof(float);
-                        memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
-                        memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
-                        kv_caches[i]->len = kv_snapshots[i].len;
-                        // Also restore GPU KV mirror
-                        if (g_metal) {
-                            int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
-                            if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
-                                memcpy([g_metal->buf_kv_k[fa_idx] contents],
-                                       kv_snapshots[i].k_snapshot, sz);
-                                memcpy([g_metal->buf_kv_v[fa_idx] contents],
-                                       kv_snapshots[i].v_snapshot, sz);
-                            }
-                        }
-                    } else if (kv_caches[i]) {
-                        kv_caches[i]->len = 0;
-                    }
-                    if (layer_states[i] && la_conv_snapshots[i]) {
-                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                        memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
-                        memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
-                    } else if (layer_states[i]) {
-                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                        memset(s->conv_state, 0, conv_state_size);
-                        memset(s->ssm_state, 0, ssm_state_size);
-                    }
-                }
-                // Restore GPU delta-net state
-                if (g_metal && g_metal->delta_net_step) {
-                    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-                        if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
-                            memcpy([g_metal->buf_delta_state[i] contents],
-                                   gpu_delta_snapshots[i], 64*128*128*sizeof(float));
-                        if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
-                            memcpy([g_metal->buf_conv_state[i] contents],
-                                   gpu_conv_snapshots[i], 3*12288*sizeof(float));
-                    }
-                } else {
-                    reset_delta_net_state();
-                }
-                pos = sys_prompt_len;  // start after cached system prompt
-                // Update active session
-                if (has_session) {
-                    strncpy(active_session_id, req_session_id, sizeof(active_session_id) - 1);
-                    active_session_id[sizeof(active_session_id) - 1] = '\0';
-                } else {
-                    active_session_id[0] = '\0';
-                }
+            for (int i = 0; i < pt->count; i++) {
+                if (pt->ids[i] < VOCAB_SIZE) token_counts[pt->ids[i]]++;
             }
+
+            fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
+                    is_incremental ? " (incremental)" : "");
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
 
-            // ---- Send SSE headers ----
-            http_write_str(client_fd, SSE_HEADERS);
+            if (req.stream) {
+                http_write_str(client_fd, SSE_HEADERS);
+            }
 
             // ---- Batch prefill ----
             double t_prefill = now_ms();
-            // Pre-embed all request tokens
             float *serve_embed_batch = NULL;
             if (pt->count > 1) {
                 serve_embed_batch = malloc((size_t)pt->count * HIDDEN_DIM * sizeof(float));
@@ -6362,13 +7505,11 @@ static void serve_loop(
 
             // ---- Final norm + LM head for first token ----
             if (final_norm_w) {
-                float *normed = malloc(HIDDEN_DIM * sizeof(float));
-                cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-                memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-                free(normed);
+                cpu_rms_norm(hidden, final_norm_w, s_final_norm, HIDDEN_DIM, RMS_NORM_EPS);
+                memcpy(hidden, s_final_norm, HIDDEN_DIM * sizeof(float));
             }
             lm_head_forward(wf, hidden, logits);
-            int next_token = cpu_argmax(logits, VOCAB_SIZE);
+            int next_token = sample_next_token(logits, VOCAB_SIZE, &req.sampler, token_counts);
 
             // ---- Auto-regressive generation with SSE streaming ----
             if (g_pred_enabled) {
@@ -6379,13 +7520,13 @@ static void serve_loop(
             int gen_count = 0;
             int in_think = 0;
             int think_tokens = 0;
-            // Accumulate response for session persistence
+            TokenStreamDecoder stream_dec;
+            token_stream_decoder_reset(&stream_dec);
             char *gen_response = calloc(1, 256 * 1024);
             int gen_resp_len = 0;
 
-            for (int gen = 0; gen < max_gen; gen++) {
+            for (int gen = 0; gen < req.max_tokens; gen++) {
                 if (next_token == EOS_TOKEN_1 || next_token == EOS_TOKEN_2) {
-                    // Feed EOS through the model so session state includes it
                     cache_telemetry_note_token();
                     embed_lookup(wf, next_token, hidden);
                     for (int layer = 0; layer < NUM_LAYERS; layer++) {
@@ -6395,39 +7536,46 @@ static void serve_loop(
                                             is_full ? NULL : layer_states[layer],
                                             pos,
                                             layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
-                                            K, layer_fds[layer]);
+                                        K, layer_fds[layer]);
                     }
                     discard_deferred_experts();
                     pos++;
                     break;
                 }
 
-                // Think budget enforcement
-                if (next_token == THINK_START_TOKEN) in_think = 1;
-                if (next_token == THINK_END_TOKEN) in_think = 0;
+                int emit_token = !in_think;
+                if (next_token == THINK_START_TOKEN) {
+                    in_think = 1;
+                    emit_token = 0;
+                } else if (next_token == THINK_END_TOKEN) {
+                    in_think = 0;
+                    emit_token = 0;
+                }
                 if (in_think) {
                     think_tokens++;
                     if (g_think_budget > 0 && think_tokens >= g_think_budget) {
-                        next_token = THINK_END_TOKEN;  // force end thinking
+                        next_token = THINK_END_TOKEN;
                         in_think = 0;
+                        emit_token = 0;
                     }
                 }
+                if (next_token < VOCAB_SIZE) token_counts[next_token]++;
 
-                const char *tok_str = decode_token(vocab, next_token);
-                // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
-                    int tlen = (int)strlen(tok_str);
-                    memcpy(gen_response + gen_resp_len, tok_str, tlen);
-                    gen_resp_len += tlen;
+                char tok_text[4096];
+                int tok_len = token_stream_decode(vocab, next_token, &stream_dec, tok_text, sizeof(tok_text));
+                tok_text[tok_len] = '\0';
+                if (emit_token && tok_len > 0 && gen_resp_len + tok_len < 256*1024 - 1) {
+                    memcpy(gen_response + gen_resp_len, tok_text, tok_len);
+                    gen_resp_len += tok_len;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                if (req.stream && emit_token && tok_len > 0 &&
+                    sse_send_delta(client_fd, request_id, tok_text) < 0) {
                     fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
                     break;
                 }
                 gen_count++;
 
-                // Generate next
                 cache_telemetry_note_token();
                 embed_lookup(wf, next_token, hidden);
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
@@ -6443,25 +7591,38 @@ static void serve_loop(
                 pos++;
 
                 if (final_norm_w) {
-                    float *normed = malloc(HIDDEN_DIM * sizeof(float));
-                    cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-                    memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-                    free(normed);
+                    cpu_rms_norm(hidden, final_norm_w, s_final_norm, HIDDEN_DIM, RMS_NORM_EPS);
+                    memcpy(hidden, s_final_norm, HIDDEN_DIM * sizeof(float));
                 }
                 lm_head_forward(wf, hidden, logits);
-                next_token = cpu_argmax(logits, VOCAB_SIZE);
+                next_token = sample_next_token(logits, VOCAB_SIZE, &req.sampler, token_counts);
             }
 
-            sse_send_done(client_fd, request_id);
+            {
+                char tail[16];
+                int tail_len = token_stream_flush(&stream_dec, tail, sizeof(tail));
+                if (tail_len > 0) {
+                    if (!in_think && gen_resp_len + tail_len < 256*1024 - 1) {
+                        memcpy(gen_response + gen_resp_len, tail, tail_len);
+                        gen_resp_len += tail_len;
+                        gen_response[gen_resp_len] = 0;
+                    }
+                    if (req.stream) sse_send_delta(client_fd, request_id, tail);
+                }
+            }
 
-            // ---- Save session state ----
-            free(gen_response);
-            // The KV caches + linear attention state already contain this conversation.
-            // Just record the position so the next request can continue from here.
-            session_pos = pos;
-            fprintf(stderr, "[serve] %s session_pos=%d (session=%s)\n",
-                    request_id, session_pos,
-                    active_session_id[0] ? active_session_id : "(none)");
+            if (req.stream) {
+                sse_send_done(client_fd, request_id);
+            } else {
+                send_chat_json_response(client_fd, request_id, gen_response);
+            }
+
+            if (req.has_session) {
+                SessionState *slot = session_acquire(sessions, req.session_id, ++session_clock);
+                session_capture_runtime(slot, kv_caches, layer_states, kv_dim, conv_state_size, ssm_state_size, pos, token_counts);
+                fprintf(stderr, "[serve] %s session_pos=%d (session=%s)\n",
+                        request_id, pos, slot->session_id);
+            }
 
             double gen_ms = now_ms() - t_gen;
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
@@ -6473,8 +7634,12 @@ static void serve_loop(
                 cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
             }
 
+            free(gen_response);
+            free(token_counts);
+            free(full_prompt);
             free(pt->ids);
             free(pt);
+            chat_request_free(&req);
             free(reqbuf);
             close(client_fd);
             continue;
@@ -6501,12 +7666,20 @@ static void print_usage(const char *prog) {
     printf("  --model PATH         Model path\n");
     printf("  --weights PATH       model_weights.bin path\n");
     printf("  --manifest PATH      model_weights.json path\n");
-    printf("  --vocab PATH         vocab.bin path\n");
+    printf("  --vocab PATH         vocab.bin path (token decode table)\n");
     printf("  --prompt-tokens PATH prompt_tokens.bin path\n");
-    printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
+    printf("  --prompt TEXT         Prompt text (requires tokenizer.bin in cwd)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
     printf("  --k N                Active experts per layer (default: 4)\n");
-    printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
+    printf("  --temperature F      Sampling temperature (default: 0.7, 0 = greedy)\n");
+    printf("  --top-p F            Nucleus sampling threshold (default: 0.9)\n");
+    printf("  --top-k N            Candidate shortlist size (default: 40, 0 = auto)\n");
+    printf("  --presence-penalty F Presence penalty (default: 0)\n");
+    printf("  --frequency-penalty F Frequency penalty (default: 0)\n");
+    printf("  --repetition-penalty F Repetition penalty (default: 1.05)\n");
+    printf("  --seed N             RNG seed for deterministic sampling\n");
+    printf("  --debug-logits       Print first-token top logits for debugging\n");
+    printf("  --cache-entries N    Expert LRU cache size (default: 0, disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
@@ -6514,6 +7687,12 @@ static void print_usage(const char *prog) {
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
+    printf("  --profile NAME       Runtime profile: speed|balanced|quality\n");
+    printf("  --kv-quant MODE      KV cache mode: off|baseline|turbo-k\n");
+    printf("  --kv-hot-window N    Raw KV tokens kept uncompressed (default: 4096)\n");
+    printf("  --kv-block-size N    Cold KV block size (default: 256)\n");
+    printf("  --layout-manifest P  Expert layout manifest v2 JSON\n");
+    printf("  --metrics-json P     Write run metrics to JSON file\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --think-budget N     Max thinking tokens before force </think> (default: 2048, 0=unlimited)\n");
@@ -6534,6 +7713,24 @@ int main(int argc, char **argv) {
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
+        int explicit_k = 0;
+        int explicit_cache_entries = 0;
+        int explicit_malloc_cache = 0;
+        int explicit_use_2bit = 0;
+        int explicit_kv_quant = 0;
+        int explicit_kv_hot_window = 0;
+        SamplerConfig cli_sampler = {
+            .temperature = 0.7f,
+            .top_p = 0.9f,
+            .top_k = 40,
+            .presence_penalty = 0.0f,
+            .frequency_penalty = 0.0f,
+            .repetition_penalty = 1.05f,
+            .rng_state = 1ULL,
+        };
+        struct timeval cli_tv;
+        gettimeofday(&cli_tv, NULL);
+        cli_sampler.rng_state = ((uint64_t)cli_tv.tv_sec << 20) ^ (uint64_t)cli_tv.tv_usec ^ ((uint64_t)getpid() << 32);
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -6544,6 +7741,14 @@ int main(int argc, char **argv) {
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
             {"k",             required_argument, 0, 'k'},
+            {"temperature",   required_argument, 0, 'u'},
+            {"top-p",         required_argument, 0, 'o'},
+            {"top-k",         required_argument, 0, 'Q'},
+            {"presence-penalty", required_argument, 0, 'A'},
+            {"frequency-penalty", required_argument, 0, 'Y'},
+            {"repetition-penalty", required_argument, 0, 'X'},
+            {"seed",          required_argument, 0, 'e'},
+            {"debug-logits",  no_argument,       0, 'd'},
             {"cache-entries",  required_argument, 0, 'C'},
             {"malloc-cache",   required_argument, 0, 'M'},
             {"cpu-linear",    no_argument,       0, 'L'},
@@ -6557,12 +7762,18 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"profile",       required_argument, 0, 'r'},
+            {"kv-quant",      required_argument, 0, 'n'},
+            {"kv-hot-window", required_argument, 0, 'W'},
+            {"kv-block-size", required_argument, 0, 'I'},
+            {"layout-manifest", required_argument, 0, 'J'},
+            {"metrics-json",  required_argument, 0, 'U'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:u:o:Q:A:Y:X:e:dC:M:R:B:LSTFE2Gr:n:W:I:J:U:h", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6571,17 +7782,44 @@ int main(int argc, char **argv) {
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
-                case 'k': K = atoi(optarg); break;
-                case 'C': cache_entries = atoi(optarg); break;
-                case 'M': malloc_cache_entries = atoi(optarg); break;
+                case 'k': K = atoi(optarg); explicit_k = 1; break;
+                case 'u': cli_sampler.temperature = MAX(0.0f, atof(optarg)); break;
+                case 'o': cli_sampler.top_p = atof(optarg); break;
+                case 'Q': cli_sampler.top_k = atoi(optarg); break;
+                case 'A': cli_sampler.presence_penalty = atof(optarg); break;
+                case 'Y': cli_sampler.frequency_penalty = atof(optarg); break;
+                case 'X': cli_sampler.repetition_penalty = atof(optarg); break;
+                case 'e': cli_sampler.rng_state = strtoull(optarg, NULL, 10); if (!cli_sampler.rng_state) cli_sampler.rng_state = 1ULL; break;
+                case 'd': g_debug_logits = 1; break;
+                case 'C': cache_entries = atoi(optarg); explicit_cache_entries = 1; break;
+                case 'M': malloc_cache_entries = atoi(optarg); explicit_malloc_cache = 1; break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
-                case '2': g_use_2bit = 1; break;
+                case '2': g_use_2bit = 1; explicit_use_2bit = 1; break;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
+                case 'r':
+                    g_runtime_profile = parse_runtime_profile(optarg);
+                    if (g_runtime_profile == PROFILE_CUSTOM) {
+                        fprintf(stderr, "ERROR: unknown profile '%s'\n", optarg);
+                        return 1;
+                    }
+                    break;
+                case 'n':
+                    g_kv_quant_mode = parse_kv_quant_mode(optarg);
+                    explicit_kv_quant = 1;
+                    if (strcmp(optarg, "off") != 0 && g_kv_quant_mode == KV_QUANT_OFF) {
+                        fprintf(stderr, "ERROR: unknown kv quant mode '%s'\n", optarg);
+                        return 1;
+                    }
+                    break;
+                case 'W': g_kv_hot_window = atoi(optarg); explicit_kv_hot_window = 1; break;
+                case 'I': g_kv_block_size = atoi(optarg); break;
+                case 'J': g_layout_manifest_path = optarg; break;
+                case 'U': g_metrics_json_path = optarg; break;
                 case 'Z':
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {
@@ -6594,6 +7832,36 @@ int main(int argc, char **argv) {
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
+        }
+        if (cli_sampler.top_p <= 0.0f || cli_sampler.top_p > 1.0f) cli_sampler.top_p = 0.9f;
+        if (cli_sampler.top_k < 0) cli_sampler.top_k = 0;
+        if (cli_sampler.repetition_penalty < 1.0f) cli_sampler.repetition_penalty = 1.0f;
+        if (g_runtime_profile != PROFILE_CUSTOM) {
+            if (!explicit_k) {
+                if (g_runtime_profile == PROFILE_SPEED) K = 2;
+                else if (g_runtime_profile == PROFILE_BALANCED) K = 4;
+                else K = 10;
+            }
+            if (!explicit_use_2bit) {
+                g_use_2bit = (g_runtime_profile != PROFILE_QUALITY);
+            }
+            if (!explicit_cache_entries && !explicit_malloc_cache) {
+                cache_entries = 0;
+                malloc_cache_entries = 0;
+            }
+            if (!explicit_kv_quant) {
+                g_kv_quant_mode = (g_runtime_profile == PROFILE_QUALITY) ? KV_QUANT_OFF : KV_QUANT_BASELINE;
+            }
+        }
+        if (g_kv_quant_mode == KV_QUANT_TURBO_K) {
+            fprintf(stderr, "[kv] turbo-k currently reuses baseline cold-block storage with K-side hook points enabled\n");
+        }
+        if (!explicit_kv_hot_window && g_kv_quant_mode == KV_QUANT_OFF) g_kv_hot_window = MAX_SEQ_LEN;
+        if (g_kv_hot_window <= 0) g_kv_hot_window = (g_kv_quant_mode == KV_QUANT_OFF) ? MAX_SEQ_LEN : 4096;
+        if (g_kv_block_size <= 0) g_kv_block_size = 256;
+        if (g_kv_hot_window != MAX_SEQ_LEN && (g_kv_hot_window % g_kv_block_size) != 0) {
+            fprintf(stderr, "ERROR: --kv-hot-window must be a multiple of --kv-block-size\n");
+            return 1;
         }
 
         // Build default paths
@@ -6627,6 +7895,15 @@ int main(int argc, char **argv) {
             }
             vocab_path = default_vocab;
         }
+        if (!model_path || !model_path[0]) {
+            fprintf(stderr, "ERROR: --model PATH is required.\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+        expert_layout_manifest_init_identity(&g_layout_manifest);
+        if (g_layout_manifest_path && !load_expert_layout_manifest(g_layout_manifest_path, &g_layout_manifest)) {
+            return 1;
+        }
 
         // ---- Initialize Metal ----
         g_metal = metal_setup();
@@ -6653,8 +7930,13 @@ int main(int argc, char **argv) {
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);
+        printf("Profile:  %s\n", runtime_profile_name(g_runtime_profile));
         printf("K:        %d experts/layer\n", K);
         printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
+        printf("KV:       %s (hot=%d, block=%d)\n", kv_quant_mode_name(g_kv_quant_mode), g_kv_hot_window, g_kv_block_size);
+        printf("Layout:   v%d%s%s\n", g_layout_manifest.version,
+               g_layout_manifest.loaded ? " from " : "",
+               g_layout_manifest.loaded && g_layout_manifest_path ? g_layout_manifest_path : "");
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
@@ -6692,13 +7974,13 @@ int main(int argc, char **argv) {
             if (prompt_text) {
                 pt = encode_prompt_text_to_tokens(prompt_text);
                 if (!pt) {
-                    fprintf(stderr, "ERROR: Failed to encode prompt. Make sure encode_prompt.py exists.\n");
+                    fprintf(stderr, "ERROR: Failed to encode prompt. Make sure tokenizer.bin exists in the working directory.\n");
                     return 1;
                 }
             } else if (!prompt_tokens_path) {
                 pt = encode_prompt_text_to_tokens("Hello, what is");
                 if (!pt) {
-                    fprintf(stderr, "ERROR: No prompt tokens and encode_prompt.py not found\n");
+                    fprintf(stderr, "ERROR: No prompt tokens and tokenizer.bin not found\n");
                     return 1;
                 }
             } else {
@@ -6716,21 +7998,19 @@ int main(int argc, char **argv) {
             printf("\n");
         }
 
-        // ---- Auto-detect 2-bit experts ----
-        if (!g_use_2bit) {
-            char probe[1024];
-            snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
-            int pfd = open(probe, O_RDONLY);
-            if (pfd >= 0) {
-                close(pfd);
-                snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
-                int pfd4 = open(probe, O_RDONLY);
-                if (pfd4 < 0) {
-                    g_use_2bit = 1;
-                    printf("[auto] Using 2-bit experts (4-bit not found)\n");
-                } else {
-                    close(pfd4);
-                }
+        // ---- Expert quant selection / fallback ----
+        {
+            char probe2[1024], probe4[1024];
+            snprintf(probe2, sizeof(probe2), "%s/packed_experts_2bit/layer_00.bin", model_path);
+            snprintf(probe4, sizeof(probe4), "%s/packed_experts/layer_00.bin", model_path);
+            int have_2bit = (access(probe2, R_OK) == 0);
+            int have_4bit = (access(probe4, R_OK) == 0);
+            if (g_use_2bit && !have_2bit && have_4bit) {
+                g_use_2bit = 0;
+                printf("[auto] Requested 2-bit experts but only 4-bit files are available; falling back to 4-bit\n");
+            } else if (!g_use_2bit && have_2bit && !have_4bit) {
+                g_use_2bit = 1;
+                printf("[auto] Using 2-bit experts (4-bit not found)\n");
             }
         }
 
@@ -6874,6 +8154,10 @@ int main(int argc, char **argv) {
         if (g_cache_telemetry_enabled) cache_telemetry_reset();
         printf("--- Generating %d tokens ---\n", max_tokens);
         int pos = 0;  // position counter for RoPE
+        uint32_t *token_counts = calloc(VOCAB_SIZE, sizeof(uint32_t));
+        for (int i = 0; i < pt->count; i++) {
+            if (pt->ids[i] < VOCAB_SIZE) token_counts[pt->ids[i]]++;
+        }
 
         // ---- Batch prefill: pre-embed all prompt tokens ----
         // Embedding all tokens upfront into a batch buffer avoids interleaving
@@ -6965,10 +8249,8 @@ int main(int argc, char **argv) {
 
         // ---- Final norm ----
         if (final_norm_w) {
-            float *normed = malloc(HIDDEN_DIM * sizeof(float));
-            cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-            memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-            free(normed);
+            cpu_rms_norm(hidden, final_norm_w, s_final_norm, HIDDEN_DIM, RMS_NORM_EPS);
+            memcpy(hidden, s_final_norm, HIDDEN_DIM * sizeof(float));
         }
 
         // ---- LM head ----
@@ -6977,11 +8259,10 @@ int main(int argc, char **argv) {
         double lm_ms = now_ms() - t_lm;
 
         // ---- Sample first token ----
-        int next_token = cpu_argmax(logits, VOCAB_SIZE);
+        int next_token = sample_next_token(logits, VOCAB_SIZE, &cli_sampler, token_counts);
         double ttft_ms = now_ms() - t0;
 
-        // Debug: show top-5 logits for first token
-        {
+        if (g_debug_logits) {
             // Find top 5 manually
             int top5[5] = {0,0,0,0,0};
             float topv[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
@@ -7002,7 +8283,13 @@ int main(int argc, char **argv) {
                ttft_ms, pt->count, lm_ms);
 
         printf("\n--- Output ---\n");
-        printf("%s", decode_token(vocab, next_token));
+        TokenStreamDecoder cli_stream_dec;
+        token_stream_decoder_reset(&cli_stream_dec);
+        {
+            char tok_text[4096];
+            int tok_len = token_stream_decode(vocab, next_token, &cli_stream_dec, tok_text, sizeof(tok_text));
+            if (tok_len > 0) fwrite(tok_text, 1, tok_len, stdout);
+        }
         fflush(stdout);
 
         int total_generated = 1;
@@ -7028,6 +8315,11 @@ int main(int argc, char **argv) {
             if (next_token == THINK_START_TOKEN) in_think = 1;
             if (next_token == THINK_END_TOKEN) in_think = 0;
             if (in_think) think_tokens++;
+            if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
+                next_token = THINK_END_TOKEN;
+                in_think = 0;
+            }
+            if (next_token < VOCAB_SIZE) token_counts[next_token]++;
 
             // Embed the just-generated token (next iteration)
             cache_telemetry_note_token();
@@ -7049,27 +8341,22 @@ int main(int argc, char **argv) {
 
             // Final norm
             if (final_norm_w) {
-                float *normed = malloc(HIDDEN_DIM * sizeof(float));
-                cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-                memcpy(hidden, normed, HIDDEN_DIM * sizeof(float));
-                free(normed);
+                cpu_rms_norm(hidden, final_norm_w, s_final_norm, HIDDEN_DIM, RMS_NORM_EPS);
+                memcpy(hidden, s_final_norm, HIDDEN_DIM * sizeof(float));
             }
 
             // LM head
             lm_head_forward(wf, hidden, logits);
 
-            // Greedy sample
-            next_token = cpu_argmax(logits, VOCAB_SIZE);
-
-            // Think budget: force end thinking if over budget
-            if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {
-                next_token = THINK_END_TOKEN;
-                in_think = 0;
-            }
+            next_token = sample_next_token(logits, VOCAB_SIZE, &cli_sampler, token_counts);
             total_generated++;
 
             // Print decoded token
-            printf("%s", decode_token(vocab, next_token));
+            {
+                char tok_text[4096];
+                int tok_len = token_stream_decode(vocab, next_token, &cli_stream_dec, tok_text, sizeof(tok_text));
+                if (tok_len > 0) fwrite(tok_text, 1, tok_len, stdout);
+            }
             fflush(stdout);
 
             double t_gen_end = now_ms();
@@ -7080,9 +8367,19 @@ int main(int argc, char **argv) {
                     gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
         }
 
+        {
+            char tail[16];
+            int tail_len = token_stream_flush(&cli_stream_dec, tail, sizeof(tail));
+            if (tail_len > 0) fwrite(tail, 1, tail_len, stdout);
+        }
+
         if (g_timing_enabled) timing_print();
         printf("\n\n--- Statistics ---\n");
         double total_time = now_ms() - t0;
+        size_t kv_raw_bytes_total = 0, kv_live_bytes_total = 0;
+        int kv_cold_blocks_total = 0, kv_cold_tokens_total = 0;
+        kv_cache_collect_stats(kv_caches, &kv_raw_bytes_total, &kv_live_bytes_total,
+                               &kv_cold_blocks_total, &kv_cold_tokens_total);
         printf("Total time:     %.1f s\n", total_time / 1000.0);
         printf("TTFT:           %.0f ms\n", ttft_ms);
         printf("Tokens:         %d generated\n", total_generated);
@@ -7092,6 +8389,9 @@ int main(int argc, char **argv) {
                    gen_time / 1000.0, (total_generated - 1) * 1000.0 / gen_time);
         }
         printf("Config:         K=%d experts, %d layers\n", K, NUM_LAYERS);
+        printf("KV cache:       raw %.2f MB, live %.2f MB, cold blocks %d (%d tokens)\n",
+               kv_raw_bytes_total / 1e6, kv_live_bytes_total / 1e6,
+               kv_cold_blocks_total, kv_cold_tokens_total);
         if (g_expert_cache) {
             uint64_t total = g_expert_cache->hits + g_expert_cache->misses;
             printf("Expert cache:   %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
@@ -7107,6 +8407,7 @@ int main(int argc, char **argv) {
                    g_malloc_cache->num_entries, g_malloc_cache->max_entries);
             cache_telemetry_print(g_malloc_cache->hits, g_malloc_cache->misses);
         }
+        free(token_counts);
 
         if (g_spec_route_attempts > 0) {
             printf("Spec routing:   %llu attempts, %llu preloads, %llu hits (%.1f%% prediction accuracy)\n",
@@ -7116,6 +8417,7 @@ int main(int argc, char **argv) {
         }
 
         if (g_freq_tracking) freq_print_analysis(K);
+        write_metrics_json(g_metrics_json_path, K, pt->count, total_generated, ttft_ms, total_time, kv_caches);
         if (g_routing_log) {
             fclose(g_routing_log);
             fprintf(stderr, "[routing] Logged %d samples to routing data file\n",
