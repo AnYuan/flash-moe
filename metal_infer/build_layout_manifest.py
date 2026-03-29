@@ -14,6 +14,7 @@ Input routing log format matches `./infer --collect-routing`:
 Usage:
     python build_layout_manifest.py --output layout_manifest_v2.json
     python build_layout_manifest.py --routing-log routing.bin --output layout_manifest_v2.json
+    python build_layout_manifest.py --routing-log routing.bin --output layout_manifest_v2.json --strategy hotband --hot-band-size 64
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ NUM_LAYERS = 60
 NUM_EXPERTS = 512
 HIDDEN_DIM = 4096
 RECENT_WINDOW = 8
+DEFAULT_HOT_BAND_SIZE = 64
 
 
 def load_routing_log(path: Path):
@@ -47,7 +49,7 @@ def load_routing_log(path: Path):
     return samples
 
 
-def build_layer_orders(samples, strategy: str):
+def build_layer_orders(samples, strategy: str, hot_band_size: int):
     freq = [Counter() for _ in range(NUM_LAYERS)]
     pair_counts = [defaultdict(int) for _ in range(NUM_LAYERS)]
 
@@ -62,6 +64,13 @@ def build_layer_orders(samples, strategy: str):
 
     orders = []
     for layer_idx in range(NUM_LAYERS):
+        if strategy == "hotband":
+            hot = [expert for expert, _count in freq[layer_idx].most_common(hot_band_size)]
+            hot_set = set(hot)
+            order = hot + [expert for expert in range(NUM_EXPERTS) if expert not in hot_set]
+            orders.append(order)
+            continue
+
         remaining = set(range(NUM_EXPERTS))
         placed = []
         if not remaining:
@@ -113,8 +122,10 @@ def main():
     parser = argparse.ArgumentParser(description="Build expert layout manifest v2")
     parser.add_argument("--routing-log", type=Path, help="Routing data collected by ./infer --collect-routing")
     parser.add_argument("--output", type=Path, required=True, help="Output manifest path")
-    parser.add_argument("--strategy", choices=["identity", "coaccess"], default="coaccess",
-                        help="Layout strategy (default: coaccess)")
+    parser.add_argument("--strategy", choices=["identity", "coaccess", "hotband"], default="hotband",
+                        help="Layout strategy (default: hotband)")
+    parser.add_argument("--hot-band-size", type=int, default=DEFAULT_HOT_BAND_SIZE,
+                        help="Number of hottest experts to move to the front for hotband strategy")
     parser.add_argument("--model-revision", default="", help="Optional model revision string")
     args = parser.parse_args()
 
@@ -129,7 +140,7 @@ def main():
         freq = [Counter() for _ in range(NUM_LAYERS)]
         strategy = "identity"
     else:
-        orders, freq = build_layer_orders(samples, args.strategy)
+        orders, freq = build_layer_orders(samples, args.strategy, args.hot_band_size)
         strategy = args.strategy
 
     layers = invert_orders_to_mapping(orders)
@@ -144,6 +155,7 @@ def main():
             "num_layers": NUM_LAYERS,
             "num_experts": NUM_EXPERTS,
             "samples": len(samples),
+            "hot_band_size": args.hot_band_size if strategy == "hotband" else 0,
             "top_hot_experts_per_layer": [
                 [expert for expert, _count in freq[layer_idx].most_common(8)]
                 for layer_idx in range(NUM_LAYERS)
@@ -153,6 +165,11 @@ def main():
 
     args.output.write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Wrote layout manifest v2 to {args.output}")
+    print(f"Strategy: {strategy}")
+    if strategy == "hotband":
+        print(f"Hot band: {args.hot_band_size} experts/layer")
+    if samples:
+        print(f"Samples:  {len(samples)}")
 
 
 if __name__ == "__main__":

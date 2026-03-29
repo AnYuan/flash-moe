@@ -26,14 +26,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from layout_manifest import layer_orders_from_manifest, load_layout_manifest
+
 
 NUM_LAYERS = 60
 NUM_EXPERTS = 512
-DEFAULT_MODEL = (
-    Path.home()
-    / ".cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit"
-    / "snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
-)
 
 ORDER = [
     ("gate_proj", "weight", "U32", [NUM_EXPERTS, 1024, 512], 2_097_152),
@@ -127,6 +124,7 @@ def pack_layer(
     layer: int,
     layer_slices: list[TensorSlice],
     mmaps: dict[str, mmap.mmap],
+    physical_order: list[int],
 ) -> None:
     output_path = output_dir / f"layer_{layer:02d}.bin"
     if output_path.exists() and output_path.stat().st_size == LAYER_SIZE:
@@ -141,18 +139,18 @@ def pack_layer(
     bytes_written = 0
 
     with tmp_path.open("wb") as out_f:
-        for expert_idx in range(NUM_EXPERTS):
+        for physical_idx, logical_idx in enumerate(physical_order):
             for tensor_slice in layer_slices:
                 src = mmaps[tensor_slice.filename]
-                start = tensor_slice.start + expert_idx * tensor_slice.per_expert_bytes
+                start = tensor_slice.start + logical_idx * tensor_slice.per_expert_bytes
                 end = start + tensor_slice.per_expert_bytes
                 out_f.write(src[start:end])
                 bytes_written += tensor_slice.per_expert_bytes
 
-            if (expert_idx + 1) % 64 == 0 or expert_idx == NUM_EXPERTS - 1:
-                pct = (expert_idx + 1) * 100.0 / NUM_EXPERTS
+            if (physical_idx + 1) % 64 == 0 or physical_idx == NUM_EXPERTS - 1:
+                pct = (physical_idx + 1) * 100.0 / NUM_EXPERTS
                 print(
-                    f"  layer {layer:02d}: expert {expert_idx + 1:3d}/{NUM_EXPERTS} "
+                    f"  layer {layer:02d}: slot {physical_idx + 1:3d}/{NUM_EXPERTS} "
                     f"({pct:5.1f}%)"
                 )
 
@@ -177,7 +175,7 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=Path,
-        default=DEFAULT_MODEL,
+        required=True,
         help="HF snapshot directory containing model.safetensors.index.json",
     )
     parser.add_argument(
@@ -192,6 +190,12 @@ def main() -> None:
         default=None,
         help="Pack only one layer index",
     )
+    parser.add_argument(
+        "--layout-manifest",
+        type=Path,
+        default=None,
+        help="Optional layout manifest v2; writes experts in physical order",
+    )
     args = parser.parse_args()
 
     model_path = args.model.expanduser().resolve()
@@ -202,9 +206,13 @@ def main() -> None:
     print(f"Output: {output_dir}")
     print(f"Expert size: {EXPERT_SIZE:,} bytes")
     print(f"Layer size:  {LAYER_SIZE / 1e9:.2f} GB")
+    if args.layout_manifest:
+        print(f"Layout: {args.layout_manifest}")
 
     t0 = time.time()
     layer_map = build_layer_slices(model_path)
+    layout_manifest = load_layout_manifest(args.layout_manifest) if args.layout_manifest else None
+    layer_orders = layer_orders_from_manifest(layout_manifest)
     layers = [args.layer] if args.layer is not None else list(range(NUM_LAYERS))
     for layer in layers:
         if layer < 0 or layer >= NUM_LAYERS:
@@ -220,7 +228,7 @@ def main() -> None:
             mmaps[filename] = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
         for layer in layers:
-            pack_layer(model_path, output_dir, layer, layer_map[layer], mmaps)
+            pack_layer(model_path, output_dir, layer, layer_map[layer], mmaps, layer_orders[layer])
     finally:
         for mm in mmaps.values():
             mm.close()

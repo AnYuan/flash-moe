@@ -2577,10 +2577,26 @@ static void kv_cache_reset(KVCache *c) {
     c->len = 0;
 }
 
+static void hadamard_transform_64(float *x) {
+    for (int len = 1; len < GROUP_SIZE; len <<= 1) {
+        for (int i = 0; i < GROUP_SIZE; i += (len << 1)) {
+            for (int j = 0; j < len; j++) {
+                float a = x[i + j];
+                float b = x[i + j + len];
+                x[i + j] = a + b;
+                x[i + j + len] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f / 8.0f;  // 1 / sqrt(64)
+    for (int i = 0; i < GROUP_SIZE; i++) x[i] *= norm;
+}
+
 static void kv_quantize_tensor_block(
     const float *src,
     int count,
     int kv_dim,
+    int apply_hadamard,
     int8_t **out_q,
     float **out_scales
 ) {
@@ -2593,16 +2609,23 @@ static void kv_quantize_tensor_block(
         float *row_scales = scales + (size_t)t * groups;
         for (int g = 0; g < groups; g++) {
             const float *group = row + g * GROUP_SIZE;
+            float transformed[GROUP_SIZE];
+            const float *quant_src = group;
+            if (apply_hadamard) {
+                memcpy(transformed, group, sizeof(transformed));
+                hadamard_transform_64(transformed);
+                quant_src = transformed;
+            }
             float max_abs = 0.0f;
             for (int i = 0; i < GROUP_SIZE; i++) {
-                float a = fabsf(group[i]);
+                float a = fabsf(quant_src[i]);
                 if (a > max_abs) max_abs = a;
             }
             float scale = max_abs > 1e-8f ? max_abs / 127.0f : (1.0f / 127.0f);
             row_scales[g] = scale;
             float inv = 1.0f / scale;
             for (int i = 0; i < GROUP_SIZE; i++) {
-                int qv = (int)lrintf(group[i] * inv);
+                int qv = (int)lrintf(quant_src[i] * inv);
                 if (qv > 127) qv = 127;
                 else if (qv < -127) qv = -127;
                 row_q[g * GROUP_SIZE + i] = (int8_t)qv;
@@ -2626,8 +2649,11 @@ static void kv_cache_append_block(KVCache *c, int start_pos, int count,
     memset(block, 0, sizeof(*block));
     block->start_pos = start_pos;
     block->count = count;
-    kv_quantize_tensor_block(k_src, count, kv_dim_total(), &block->k_q, &block->k_scales);
-    kv_quantize_tensor_block(v_src, count, kv_dim_total(), &block->v_q, &block->v_scales);
+    kv_quantize_tensor_block(k_src, count, kv_dim_total(),
+                             g_kv_quant_mode == KV_QUANT_TURBO_K,
+                             &block->k_q, &block->k_scales);
+    kv_quantize_tensor_block(v_src, count, kv_dim_total(), 0,
+                             &block->v_q, &block->v_scales);
 }
 
 static void kv_cache_flush_oldest_block(KVCache *c) {
@@ -2689,8 +2715,19 @@ static int kv_cache_gpu_compatible(const KVCache *c) {
     return c && c->num_blocks == 0 && c->hot_start == 0 && c->len == c->hot_len;
 }
 
+static void kv_prepare_query_head(const float *qh, float *prepared, int apply_hadamard) {
+    if (!apply_hadamard) {
+        memcpy(prepared, qh, HEAD_DIM * sizeof(float));
+        return;
+    }
+    for (int g = 0; g < HEAD_DIM / GROUP_SIZE; g++) {
+        memcpy(prepared + g * GROUP_SIZE, qh + g * GROUP_SIZE, GROUP_SIZE * sizeof(float));
+        hadamard_transform_64(prepared + g * GROUP_SIZE);
+    }
+}
+
 static float kv_quantized_dot_head(const int8_t *row_q, const float *row_scales,
-                                   const float *qh, int head_offset) {
+                                   const float *qh_prepared, int head_offset) {
     float dot = 0.0f;
     int start_group = head_offset / GROUP_SIZE;
     int end_group = (head_offset + HEAD_DIM) / GROUP_SIZE;
@@ -2700,7 +2737,7 @@ static float kv_quantized_dot_head(const int8_t *row_q, const float *row_scales,
         for (int i = 0; i < GROUP_SIZE; i++) {
             int d = base + i - head_offset;
             if (d >= 0 && d < HEAD_DIM) {
-                dot += qh[d] * ((float)row_q[base + i] * scale);
+                dot += qh_prepared[d] * ((float)row_q[base + i] * scale);
             }
         }
     }
@@ -2741,10 +2778,15 @@ static void kv_cache_copy_raw(const KVCache *c, float *dst_k, float *dst_v) {
                 float k_scale = ks[g];
                 float v_scale = vs[g];
                 int base = g * GROUP_SIZE;
+                float k_group[GROUP_SIZE];
                 for (int i = 0; i < GROUP_SIZE; i++) {
-                    dk[base + i] = (float)kq[base + i] * k_scale;
+                    k_group[i] = (float)kq[base + i] * k_scale;
                     dv[base + i] = (float)vq[base + i] * v_scale;
                 }
+                if (g_kv_quant_mode == KV_QUANT_TURBO_K) {
+                    hadamard_transform_64(k_group);
+                }
+                memcpy(dk + base, k_group, GROUP_SIZE * sizeof(float));
             }
             out++;
         }
@@ -3045,6 +3087,8 @@ static void full_attention_forward(
     for (int h = 0; h < NUM_ATTN_HEADS; h++) {
         int kv_h = h / heads_per_kv;
         float *qh = q + h * HEAD_DIM;
+        float qh_cold[HEAD_DIM];
+        kv_prepare_query_head(qh, qh_cold, g_kv_quant_mode == KV_QUANT_TURBO_K && kv->num_blocks > 0);
 
         // Compute attention scores for all cached positions
         float *scores = malloc(kv->len * sizeof(float));
@@ -3055,7 +3099,7 @@ static void full_attention_forward(
             for (int p = 0; p < block->count; p++) {
                 const int8_t *kq = block->k_q + (size_t)p * kv_dim;
                 const float *ks = block->k_scales + (size_t)p * kv_groups_total();
-                scores[score_idx++] = kv_quantized_dot_head(kq, ks, qh, head_offset) * scale;
+                scores[score_idx++] = kv_quantized_dot_head(kq, ks, qh_cold, head_offset) * scale;
             }
         }
         for (int p = 0; p < kv->hot_len; p++) {
@@ -5344,6 +5388,8 @@ static void fused_layer_forward(
             for (int h = 0; h < NUM_ATTN_HEADS; h++) {
                 int kv_h = h / heads_per_kv;
                 float *qh = q + h * HEAD_DIM;
+                float qh_cold[HEAD_DIM];
+                kv_prepare_query_head(qh, qh_cold, g_kv_quant_mode == KV_QUANT_TURBO_K && kv->num_blocks > 0);
                 float *scores = malloc(kv->len * sizeof(float));
                 int head_offset = kv_h * HEAD_DIM;
                 int score_idx = 0;
@@ -5352,7 +5398,7 @@ static void fused_layer_forward(
                     for (int p = 0; p < block->count; p++) {
                         const int8_t *kq = block->k_q + (size_t)p * kv_dim;
                         const float *ks = block->k_scales + (size_t)p * kv_groups_total();
-                        scores[score_idx++] = kv_quantized_dot_head(kq, ks, qh, head_offset) * scale;
+                        scores[score_idx++] = kv_quantized_dot_head(kq, ks, qh_cold, head_offset) * scale;
                     }
                 }
                 for (int p = 0; p < kv->hot_len; p++) {
@@ -7854,7 +7900,7 @@ int main(int argc, char **argv) {
             }
         }
         if (g_kv_quant_mode == KV_QUANT_TURBO_K) {
-            fprintf(stderr, "[kv] turbo-k currently reuses baseline cold-block storage with K-side hook points enabled\n");
+            fprintf(stderr, "[kv] turbo-k enabled: cold K blocks use Hadamard-transformed quantization for query/key dot products\n");
         }
         if (!explicit_kv_hot_window && g_kv_quant_mode == KV_QUANT_OFF) g_kv_hot_window = MAX_SEQ_LEN;
         if (g_kv_hot_window <= 0) g_kv_hot_window = (g_kv_quant_mode == KV_QUANT_OFF) ? MAX_SEQ_LEN : 4096;
