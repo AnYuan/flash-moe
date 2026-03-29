@@ -34,6 +34,25 @@ def read_metrics(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def summarize_metrics_dir(output_dir: Path) -> Path:
+    rows: list[dict] = []
+    for metrics_path in sorted(output_dir.glob("*.json")):
+        data = read_metrics(metrics_path)
+        if "ttft_ms" not in data:
+            continue
+        data["profile"] = data.get("profile", metrics_path.stem.split("_", 1)[0])
+        data["kv_mode"] = data.get("kv_mode", data.get("kv_quant", ""))
+        rows.append(data)
+
+    summary_path = output_dir / "summary.tsv"
+    with summary_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in FIELDNAMES})
+    return summary_path
+
+
 def build_infer_command(args, infer_path: Path, model_path: Path, weights_path: Path,
                         manifest_path: Path, vocab_path: Path, layout_manifest_path: Path | None,
                         prompt_tokens_path: Path | None, prompt_text: str,
@@ -63,10 +82,10 @@ def build_infer_command(args, infer_path: Path, model_path: Path, weights_path: 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark infer profile / KV combinations")
     parser.add_argument("--infer", type=Path, default=Path("./infer"), help="Path to infer binary")
-    parser.add_argument("--model", type=Path, required=True, help="Model snapshot dir")
-    parser.add_argument("--weights", type=Path, required=True, help="model_weights.bin")
-    parser.add_argument("--manifest", type=Path, required=True, help="model_weights.json")
-    parser.add_argument("--vocab", type=Path, required=True, help="vocab.bin")
+    parser.add_argument("--model", type=Path, help="Model snapshot dir")
+    parser.add_argument("--weights", type=Path, help="model_weights.bin")
+    parser.add_argument("--manifest", type=Path, help="model_weights.json")
+    parser.add_argument("--vocab", type=Path, help="vocab.bin")
     parser.add_argument("--layout-manifest", type=Path, default=None, help="Optional layout manifest v2")
     parser.add_argument("--profiles", nargs="+", default=["speed", "balanced", "quality"])
     parser.add_argument("--kv-modes", nargs="+", default=["off", "baseline"])
@@ -82,8 +101,27 @@ def main() -> None:
     parser.add_argument("--timeout-s", type=float, default=0,
                         help="Optional timeout per infer run (0 disables timeout)")
     parser.add_argument("--emit-script", type=Path, default=None,
-                        help="Write a zsh benchmark script instead of launching infer from Python")
+                        help="Write direct infer commands for manual terminal execution")
+    parser.add_argument("--summarize-existing", type=Path, default=None,
+                        help="Scan an output directory of metrics JSON files and write summary.tsv")
     args = parser.parse_args()
+
+    if args.summarize_existing:
+        summary_path = summarize_metrics_dir(args.summarize_existing.expanduser().resolve())
+        print(f"Wrote benchmark summary to {summary_path}")
+        return
+
+    missing = [
+        flag for flag, value in (
+            ("--model", args.model),
+            ("--weights", args.weights),
+            ("--manifest", args.manifest),
+            ("--vocab", args.vocab),
+        )
+        if value is None
+    ]
+    if missing:
+        parser.error(f"the following arguments are required: {' '.join(missing)}")
 
     infer_path = args.infer.expanduser().resolve()
     model_path = args.model.expanduser().resolve()
@@ -97,8 +135,11 @@ def main() -> None:
     summary_path = output_dir / "summary.tsv"
     rows: list[dict] = []
     prompt_text = args.prompt or "Explain why expert locality matters for MoE inference."
-    script_lines = ["#!/bin/zsh", "set -euo pipefail", f"cd {shlex.quote(str(Path.cwd()))}"]
-    emitted_runs: list[tuple[str, str, Path]] = []
+    command_lines = [
+        "# Run these commands manually from your current shell.",
+        "# Do not execute this file as a child script on this machine; Metal may fall back to CPU.",
+        f"cd {shlex.quote(str(Path.cwd()))}",
+    ]
 
     for profile in args.profiles:
         for kv_mode in args.kv_modes:
@@ -110,9 +151,8 @@ def main() -> None:
             )
             quoted_cmd = " ".join(shlex.quote(part) for part in cmd)
             log_path = output_dir / f"{run_id}.log"
-            script_lines.append(f"echo '[run] {quoted_cmd}'")
-            script_lines.append(f"{quoted_cmd} |& tee {shlex.quote(str(log_path))}")
-            emitted_runs.append((profile, kv_mode, metrics_path))
+            command_lines.append(f"echo '[run] {quoted_cmd}'")
+            command_lines.append(f"{quoted_cmd} | tee {shlex.quote(str(log_path))}")
 
             if args.emit_script:
                 continue
@@ -132,7 +172,8 @@ def main() -> None:
                 raise SystemExit(
                     f"{run_id} timed out after {args.timeout_s:.1f}s.\n"
                     "On this machine, direct Python child launches can fall back to CPU.\n"
-                    f"Use --emit-script {output_dir / 'run_benchmarks.zsh'} for a shell-driven Metal sweep."
+                    f"Use --emit-script {output_dir / 'run_benchmarks.txt'} and run the commands manually,\n"
+                    f"then call --summarize-existing {output_dir}."
                 )
 
             log_path.write_text(combined_out)
@@ -141,7 +182,8 @@ def main() -> None:
                 raise SystemExit(
                     f"{run_id} launched without Metal support.\n"
                     "On this machine, direct Python child launches can fall back to CPU.\n"
-                    f"Use --emit-script {output_dir / 'run_benchmarks.zsh'} for a shell-driven Metal sweep."
+                    f"Use --emit-script {output_dir / 'run_benchmarks.txt'} and run the commands manually,\n"
+                    f"then call --summarize-existing {output_dir}."
                 )
             if proc.returncode != 0:
                 raise SystemExit(f"{run_id} failed with code {proc.returncode}\n{combined_out}")
@@ -155,33 +197,13 @@ def main() -> None:
     if args.emit_script:
         script_path = args.emit_script.expanduser().resolve()
         script_path.parent.mkdir(parents=True, exist_ok=True)
-        script_lines.extend([
-            "python3 - <<'PY'",
-            "import csv, json",
-            f"summary_path = {str(summary_path)!r}",
-            "rows = []",
+        command_lines.extend([
+            "",
+            f"# After all commands finish, summarize with:",
+            f"# python3 benchmark_profiles.py --summarize-existing {shlex.quote(str(output_dir))}",
         ])
-        for profile, kv_mode, metrics_path in emitted_runs:
-            script_lines.extend([
-                f"with open({str(metrics_path)!r}) as f:",
-                "    data = json.load(f)",
-                f"data['profile'] = {profile!r}",
-                f"data['kv_mode'] = {kv_mode!r}",
-                "rows.append(data)",
-            ])
-        script_lines.extend([
-            f"fieldnames = {FIELDNAMES!r}",
-            "with open(summary_path, 'w', newline='') as f:",
-            "    writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\\t')",
-            "    writer.writeheader()",
-            "    for row in rows:",
-            "        writer.writerow({key: row.get(key, '') for key in fieldnames})",
-            "print(f'Wrote benchmark summary to {summary_path}')",
-            "PY",
-        ])
-        script_path.write_text("\n".join(script_lines) + "\n")
-        script_path.chmod(0o755)
-        print(f"Wrote benchmark script to {script_path}")
+        script_path.write_text("\n".join(command_lines) + "\n")
+        print(f"Wrote benchmark command list to {script_path}")
         return
 
     with summary_path.open("w", newline="") as f:
